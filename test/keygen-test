@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+
+set -eu
+
+# Test script for fusefatfs keygen subcommand
+# Tests that the master key can be unwrapped using parameters from config.json
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR/.."
+FUSE_CLI="$PROJECT_DIR/fuse/build/fusefatfs"
+DATA_DIR="$SCRIPT_DIR/data"
+
+# Test parameters
+TEST_DIR="$DATA_DIR/keygen-test-mount"
+TEST_PASSPHRASE="test-passphrase-12345"
+
+mkdir -p "$DATA_DIR/"
+
+# Cleanup function
+# shellcheck disable=SC2329
+# trapped on exit
+cleanup() {
+	echo "Cleaning up..."
+	rm -rf "$TEST_DIR"
+	rm -f "$DATA_DIR/unwrap_key"
+	echo "Cleanup complete"
+}
+
+# Set up trap to cleanup on exit
+trap cleanup EXIT
+
+# Check if FUSE binary exists
+if [ ! -x "$FUSE_CLI" ]; then
+	echo "Error: FUSE binary not found at $FUSE_CLI"
+	echo "Please build the FUSE implementation first"
+	exit 1
+fi
+
+echo "=== FatCrypt Keygen Test ==="
+echo ""
+
+# Step 1: Run keygen with passphrase
+echo "[1/5] Running keygen with passphrase..."
+mkdir -p "$TEST_DIR"
+"$FUSE_CLI" keygen --passphrase="$TEST_PASSPHRASE" "$TEST_DIR" >/dev/null
+echo "  Keygen completed"
+
+# Step 2: Verify files exist
+echo "[2/5] Verifying files exist..."
+CONFIG_FILE="$TEST_DIR/.fat_crypt/config.json"
+MASTER_KEY="$TEST_DIR/.fat_crypt/keys/master.blob"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+	echo "FAIL: config.json not created"
+	exit 1
+fi
+if [ ! -f "$MASTER_KEY" ]; then
+	echo "FAIL: master.blob not created"
+	exit 1
+fi
+echo "  Files verified"
+
+# Step 3: Build unwrap test program
+echo "[3/5] Building key unwrap test program..."
+cat > "$DATA_DIR/unwrap_key.c" << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <sodium.h>
+
+#define FATCRYPT_MASTER_MAGIC "FCMASTER"
+#define FATCRYPT_MASTER_KEY_SIZE 32
+
+int main(int argc, char *argv[]) {
+	if (argc != 7) {
+		fprintf(stderr, "Usage: %s <master.blob> <passphrase> <opslimit> <memlimit> <config.json> <config.sig>\n", argv[0]);
+		return 1;
+	}
+
+	const char *blob_path = argv[1];
+	const char *passphrase = argv[2];
+	unsigned long long opslimit = strtoull(argv[3], NULL, 10);
+	unsigned long long memlimit = strtoull(argv[4], NULL, 10);
+
+	if (sodium_init() < 0) {
+		fprintf(stderr, "Failed to initialize libsodium\n");
+		return 1;
+	}
+
+	FILE *f = fopen(blob_path, "rb");
+	if (!f) {
+		fprintf(stderr, "Failed to open %s\n", blob_path);
+		return 1;
+	}
+
+	// Read and verify magic
+	uint8_t magic[8];
+	if (fread(magic, 1, 8, f) != 8 || memcmp(magic, FATCRYPT_MASTER_MAGIC, 8) != 0) {
+		fprintf(stderr, "Invalid magic bytes\n");
+		fclose(f);
+		return 1;
+	}
+
+	// Read version
+	uint8_t version;
+	if (fread(&version, 1, 1, f) != 1) {
+		fprintf(stderr, "Failed to read version\n");
+		fclose(f);
+		return 1;
+	}
+
+	// Read encrypted flag
+	uint8_t encrypted;
+	if (fread(&encrypted, 1, 1, f) != 1) {
+		fprintf(stderr, "Failed to read encrypted flag\n");
+		fclose(f);
+		return 1;
+	}
+
+	if (!encrypted) {
+		fprintf(stderr, "Key is not encrypted\n");
+		fclose(f);
+		return 1;
+	}
+
+	// Read salt
+	uint8_t salt[crypto_pwhash_SALTBYTES];
+	if (fread(salt, 1, sizeof(salt), f) != sizeof(salt)) {
+		fprintf(stderr, "Failed to read salt\n");
+		fclose(f);
+		return 1;
+	}
+
+	// Read nonce
+	uint8_t nonce[crypto_secretbox_NONCEBYTES];
+	if (fread(nonce, 1, sizeof(nonce), f) != sizeof(nonce)) {
+		fprintf(stderr, "Failed to read nonce\n");
+		fclose(f);
+		return 1;
+	}
+
+	// Read size
+	uint8_t size_bytes[2];
+	if (fread(size_bytes, 1, 2, f) != 2) {
+		fprintf(stderr, "Failed to read size\n");
+		fclose(f);
+		return 1;
+	}
+	size_t key_size = (size_bytes[0] << 8) | size_bytes[1];
+
+	if (key_size != FATCRYPT_MASTER_KEY_SIZE) {
+		fprintf(stderr, "Invalid key size: %zu (expected %d)\n", key_size, FATCRYPT_MASTER_KEY_SIZE);
+		fclose(f);
+		return 1;
+	}
+
+	// Read ciphertext
+	uint8_t ciphertext[crypto_secretbox_MACBYTES + FATCRYPT_MASTER_KEY_SIZE];
+	if (fread(ciphertext, 1, sizeof(ciphertext), f) != sizeof(ciphertext)) {
+		fprintf(stderr, "Failed to read ciphertext\n");
+		fclose(f);
+		return 1;
+	}
+	fclose(f);
+
+	// Derive key from passphrase
+	uint8_t derived_key[crypto_secretbox_KEYBYTES];
+	if (crypto_pwhash(derived_key, sizeof(derived_key),
+	                  passphrase, strlen(passphrase),
+	                  salt,
+	                  opslimit,
+	                  memlimit,
+	                  crypto_pwhash_ALG_ARGON2ID13) != 0) {
+		fprintf(stderr, "Key derivation failed\n");
+		return 1;
+	}
+
+	// Decrypt master key
+	uint8_t master_key[FATCRYPT_MASTER_KEY_SIZE];
+	if (crypto_secretbox_open_easy(master_key, ciphertext, sizeof(ciphertext),
+	                                nonce, derived_key) != 0) {
+		fprintf(stderr, "Decryption failed (wrong passphrase or corrupted data)\n");
+		sodium_memzero(derived_key, sizeof(derived_key));
+		return 1;
+	}
+
+	sodium_memzero(derived_key, sizeof(derived_key));
+
+	printf("Successfully unwrapped master key (%d bytes)\n", FATCRYPT_MASTER_KEY_SIZE);
+
+	// Verify config signature
+	// Read config.json
+	FILE *config_file = fopen(argv[5], "rb");
+	if (!config_file) {
+		fprintf(stderr, "Failed to open config.json\n");
+		sodium_memzero(master_key, sizeof(master_key));
+		return 1;
+	}
+
+	fseek(config_file, 0, SEEK_END);
+	long config_size = ftell(config_file);
+	fseek(config_file, 0, SEEK_SET);
+
+	uint8_t *config_data = malloc(config_size);
+	if (fread(config_data, 1, config_size, config_file) != config_size) {
+		fprintf(stderr, "Failed to read config.json\n");
+		free(config_data);
+		fclose(config_file);
+		sodium_memzero(master_key, sizeof(master_key));
+		return 1;
+	}
+	fclose(config_file);
+
+	// Compute SHA256 hash of config
+	uint8_t config_hash[crypto_hash_sha256_BYTES];
+	crypto_hash_sha256(config_hash, config_data, config_size);
+	free(config_data);
+
+	// Read signature
+	FILE *sig_file = fopen(argv[6], "rb");
+	if (!sig_file) {
+		fprintf(stderr, "Failed to open config.sig\n");
+		sodium_memzero(master_key, sizeof(master_key));
+		return 1;
+	}
+
+	uint8_t signature[crypto_auth_BYTES];
+	if (fread(signature, 1, sizeof(signature), sig_file) != sizeof(signature)) {
+		fprintf(stderr, "Failed to read signature\n");
+		fclose(sig_file);
+		sodium_memzero(master_key, sizeof(master_key));
+		return 1;
+	}
+	fclose(sig_file);
+
+	// Verify signature
+	if (crypto_auth_verify(signature, config_hash, sizeof(config_hash), master_key) != 0) {
+		fprintf(stderr, "Config signature verification FAILED\n");
+		sodium_memzero(master_key, sizeof(master_key));
+		return 1;
+	}
+
+	printf("Config signature verified successfully\n");
+
+	sodium_memzero(master_key, sizeof(master_key));
+	return 0;
+}
+EOF
+
+gcc -o "$DATA_DIR/unwrap_key" "$DATA_DIR/unwrap_key.c" -lsodium
+echo "  Test program built"
+
+# Step 4: Extract parameters from config.json
+echo "[4/5] Extracting Argon2id parameters from config.json..."
+OPSLIMIT=$(grep -oP '"opslimit":\s*\K\d+' "$CONFIG_FILE")
+MEMLIMIT=$(grep -oP '"memlimit":\s*\K\d+' "$CONFIG_FILE")
+
+if [ -z "$OPSLIMIT" ] || [ -z "$MEMLIMIT" ]; then
+	echo "FAIL: Could not extract opslimit or memlimit from config.json"
+	exit 1
+fi
+
+echo "  opslimit: $OPSLIMIT"
+echo "  memlimit: $MEMLIMIT"
+
+# Step 5: Attempt to unwrap the key and verify signature
+echo "[5/5] Attempting to unwrap master key and verify config signature..."
+if "$DATA_DIR/unwrap_key" "$MASTER_KEY" "$TEST_PASSPHRASE" "$OPSLIMIT" "$MEMLIMIT" "$CONFIG_FILE" "$TEST_DIR/.fat_crypt/config.sig"; then
+	echo ""
+	echo "SUCCESS: Master key unwrapped and config verified!"
+	echo "  - Keygen created proper directory structure"
+	echo "  - config.json contains correct Argon2id parameters"
+	echo "  - master.blob can be decrypted with passphrase and config parameters"
+	echo "  - config.sig verified successfully with master key"
+	exit 0
+else
+	echo ""
+	echo "FAIL: Could not unwrap master key"
+	exit 1
+fi

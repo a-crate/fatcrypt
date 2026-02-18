@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -eu
+
+# Test script for FUSE FAT32 implementation
+# Tests basic read functionality by:
+# 1. Creating a disk image
+# 2. Formatting it as FAT32
+# 3. Writing test data with kernel FAT32 driver
+# 4. Reading it back with FUSE implementation
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR/.."
+FUSE_CLI="$PROJECT_DIR/fuse/build/fusefatfs"
+DATA_DIR="$SCRIPT_DIR/data"
+
+# Test parameters
+DISK_IMAGE="$DATA_DIR/fatcrypt-test.img"
+DISK_SIZE="50M"
+TEST_FILE="testdir/testfile.txt"
+TEST_CONTENT="Hello from FAT32 kernel driver! This is test data for FUSE implementation."
+MOUNT_KERNEL="$DATA_DIR/kernel-mount"
+MOUNT_FUSE="$DATA_DIR/fuse-mount"
+TEST_USER="$USER"
+
+mkdir -p "$DATA_DIR/"
+
+# Cleanup function
+# shellcheck disable=SC2329
+# trapped on exit
+cleanup() {
+	echo "Cleaning up..."
+
+	# Run all cleanup operations under a single sudo bash -c
+	sudo bash -c "
+		# Unmount FUSE if mounted
+		if mountpoint -q '$MOUNT_FUSE' 2>/dev/null; then
+			echo 'Unmounting FUSE mount at $MOUNT_FUSE'
+			umount '$MOUNT_FUSE' 2>/dev/null || true
+		fi
+
+		# Unmount kernel driver if mounted
+		if mountpoint -q '$MOUNT_KERNEL' 2>/dev/null; then
+			echo 'Unmounting kernel mount at $MOUNT_KERNEL'
+			umount '$MOUNT_KERNEL' 2>/dev/null || true
+		fi
+
+		# Detach any loop devices for this image
+		for loop in \$(losetup -j '$DISK_IMAGE' -O NAME -n); do
+			echo \"Detaching loop device \$loop\"
+			losetup -d \"\$loop\" 2>/dev/null || true
+		done
+
+		# Fix mangled permissions
+		chown -R '$TEST_USER' '$DATA_DIR'
+
+	"
+
+	# Remove mount points
+	rmdir "$MOUNT_KERNEL" 2>/dev/null || true
+	rmdir "$MOUNT_FUSE" 2>/dev/null || true
+
+	# Remove disk image
+	rm -f "$DISK_IMAGE"
+
+	echo "Cleanup complete"
+}
+
+# Set up trap to cleanup on exit
+trap cleanup EXIT
+
+# Check if FUSE binary exists
+if [ ! -x "$FUSE_CLI" ]; then
+	echo "Error: FUSE binary not found at $FUSE_CLI"
+	echo "Please build the FUSE implementation first with 'make fuse'"
+	exit 1
+fi
+
+# Check for required tools
+for tool in mkfs.vfat losetup mountpoint; do
+	if ! command -v "$tool" &>/dev/null; then
+		echo "Error: Required tool '$tool' not found"
+		exit 1
+	fi
+done
+
+echo "=== FAT32 FUSE Read Test ==="
+echo ""
+
+# Step 1: Create disk image
+echo "[1/7] Creating disk image ($DISK_SIZE)..."
+dd if=/dev/zero of="$DISK_IMAGE" bs=1M count=50 status=none
+echo "  Created: $DISK_IMAGE"
+
+# Step 2: Format as FAT32
+echo "[2/7] Formatting as FAT32..."
+mkfs.vfat -F 32 "$DISK_IMAGE"
+echo "  Formatted successfully"
+
+# Steps 3-7: Run all privileged operations in a single sudo bash -c
+READ_CONTENT=$(sudo bash -c "
+	set -eu
+
+	# Create loopback device
+	echo '[3/7] Creating loopback device...' >&2
+	LOOP_DEVICE=\$(losetup -f --show '$DISK_IMAGE')
+	echo '  Loop device: '\$LOOP_DEVICE >&2
+
+	# Mount with kernel FAT32 driver
+	echo '[4/7] Mounting with kernel FAT32 driver...' >&2
+	mkdir -p '$MOUNT_KERNEL'
+	mount -t vfat \"\$LOOP_DEVICE\" '$MOUNT_KERNEL'
+	echo '  Mounted at: $MOUNT_KERNEL' >&2
+
+	# Write test data
+	echo '[5/7] Writing test data...' >&2
+	mkdir -p '$MOUNT_KERNEL/$(dirname "$TEST_FILE")'
+	echo '$TEST_CONTENT' > '$MOUNT_KERNEL/$TEST_FILE'
+	echo '  file: $TEST_FILE' >&2
+	echo '  wrote: $TEST_CONTENT' >&2
+	sync
+
+	# Unmount kernel driver
+	echo '[6/7] Unmounting kernel driver...' >&2
+	umount '$MOUNT_KERNEL'
+	rmdir '$MOUNT_KERNEL'
+	echo '  Unmounted kernel driver' >&2
+
+	# Mount with FUSE implementation
+	echo '[7/7] Mounting with FUSE implementation...' >&2
+	mkdir -p '$MOUNT_FUSE'
+	'$FUSE_CLI' \"\$LOOP_DEVICE\" '$MOUNT_FUSE'
+	echo '  Mounted at: $MOUNT_FUSE' >&2
+
+	# Read back test data
+	cat '$MOUNT_FUSE/$TEST_FILE'
+")
+
+echo ""
+echo "=== Reading test data with FUSE ==="
+echo "  Read content: $READ_CONTENT"
+
+# Verify content matches
+echo ""
+if [ "$READ_CONTENT" = "$TEST_CONTENT" ]; then
+	echo "SUCCESS: Test data matches!"
+	echo "  Expected: $TEST_CONTENT"
+	echo "  Got:      $READ_CONTENT"
+	exit 0
+else
+	echo "FAIL: Test data mismatch!"
+	echo "  Expected: $TEST_CONTENT"
+	echo "  Got:      $READ_CONTENT"
+	exit 1
+fi

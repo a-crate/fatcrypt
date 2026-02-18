@@ -18,10 +18,13 @@
 /
 /----------------------------------------------------------------------------*/
 
-
+#include <stdio.h>
 #include <string.h>
 #include "ff.h"			/* Declarations of FatFs API */
 #include "diskio.h"		/* Declarations of device I/O functions */
+#include "fatcrypt.h"		/* FatCrypt encryption functions */
+#include <json-c/json.h>	/* JSON for metadata files */
+#include <sodium.h>		/* libsodium for crypto operations */
 
 
 /*--------------------------------------------------------------------------
@@ -3864,6 +3867,7 @@ FRESULT f_open (
 			fp->err = 0;		/* Clear error flag */
 			fp->sect = 0;		/* Invalidate current data sector */
 			fp->fptr = 0;		/* Set file pointer top of the file */
+			fp->crypt_logical_fptr = 0;
 #if !FF_FS_READONLY
 #if !FF_FS_TINY
 			memset(fp->buf, 0, sizeof fp->buf);	/* Clear sector buffer */
@@ -3907,6 +3911,154 @@ FRESULT f_open (
 
 
 
+/*-----------------------------------------------------------------------*/
+/* Read Encrypted File                                                   */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_crypt_read (
+	FIL* fp, 	/* Open file to be read */
+	void* buff,	/* Data buffer to store the read data */
+	UINT btr,	/* Number of bytes to read */
+	UINT* br	/* Number of bytes read */
+)
+{
+	FATFS *fs;
+	FRESULT res;
+
+	*br = 0;
+	res = validate(&fp->obj, &fs);
+	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) return res;
+
+	// Can't encrypt if no master key
+	if (!fs->master_key_loaded) {
+		fprintf(stderr, "f_crypt_read: master key not loaded\n");
+		return FR_DENIED;
+	}
+
+	BYTE *output = (BYTE*)buff;
+	UINT remaining = btr;
+	*br = 0;
+
+	UINT sector_size = SS(fs);
+
+	// Read logical file size from 8-byte header at start of file
+	BYTE size_header[8];
+	res = f_lseek(fp, 0);
+	if (res != FR_OK) return res;
+
+	UINT header_read;
+	res = f_read(fp, size_header, 8, &header_read);
+	if (res != FR_OK) return res;
+	if (header_read < 8) {
+		// File too short or empty, no data to read
+		*br = 0;
+		return FR_OK;
+	}
+
+	// Parse logical size (little-endian)
+	FSIZE_t logical_file_size = ((FSIZE_t)size_header[0]) |
+	                            ((FSIZE_t)size_header[1] << 8) |
+	                            ((FSIZE_t)size_header[2] << 16) |
+	                            ((FSIZE_t)size_header[3] << 24) |
+	                            ((FSIZE_t)size_header[4] << 32) |
+	                            ((FSIZE_t)size_header[5] << 40) |
+	                            ((FSIZE_t)size_header[6] << 48) |
+	                            ((FSIZE_t)size_header[7] << 56);
+
+	// Limit read to not exceed logical file size
+	FSIZE_t available_bytes = logical_file_size - fp->crypt_logical_fptr;
+	if (available_bytes <= 0) {
+		*br = 0;
+		return FR_OK;  // Already at or past EOF
+	}
+	if (remaining > available_bytes) {
+		remaining = (UINT)available_bytes;
+	}
+	btr = remaining;  // Update btr to reflect limited read
+
+	// Derive nonce from starting cluster
+	BYTE base_nonce[12];
+	fatcrypt_derive_file_nonce(fp->obj.sclust, base_nonce);
+
+	// crypt_logical_fptr tracks logical position in decrypted data
+	// Calculate which sector and offset within sector
+	DWORD block_idx = (DWORD)(fp->crypt_logical_fptr / sector_size);
+	UINT offset_in_sector = (UINT)(fp->crypt_logical_fptr % sector_size);
+
+	while (remaining > 0) {
+		BYTE ciphertext_buf[FF_MAX_SS];
+		BYTE plaintext_buf[FF_MAX_SS];
+		BYTE tag[16];
+		BYTE block_nonce[12];
+
+		// Calculate physical position for this block
+		// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
+		FSIZE_t physical_pos = 8 + block_idx * (sector_size + 16);
+
+		// Seek to physical position
+		res = f_lseek(fp, physical_pos);
+		if (res != FR_OK) {
+			return res;
+		}
+
+		// Read ciphertext sector
+		UINT read_count;
+		res = f_read(fp, ciphertext_buf, sector_size, &read_count);
+		if (res != FR_OK) {
+			return res;
+		}
+		if (read_count != sector_size) {
+			return FR_INT_ERR;
+		}
+
+		// Read tag
+		res = f_read(fp, tag, 16, &read_count);
+		if (res != FR_OK) {
+			return res;
+		}
+		if (read_count != 16) {
+			return FR_INT_ERR;
+		}
+
+		// Generate per-block nonce: base_nonce XOR block_index
+		memcpy(block_nonce, base_nonce, 12);
+		block_nonce[8] ^= (block_idx >> 24) & 0xFF;
+		block_nonce[9] ^= (block_idx >> 16) & 0xFF;
+		block_nonce[10] ^= (block_idx >> 8) & 0xFF;
+		block_nonce[11] ^= block_idx & 0xFF;
+
+		// Decrypt the block
+		if (fatcrypt_decrypt_block(ciphertext_buf, sector_size,
+		                            fs->master_key, sizeof(fs->master_key),
+		                            block_nonce, sizeof(block_nonce),
+		                            NULL, 0,
+		                            tag,
+		                            plaintext_buf) != 0) {
+			return FR_INT_ERR;
+		}
+
+		// Calculate how much to copy from this sector
+		// Available bytes in this sector (from offset to end)
+		UINT available = sector_size - offset_in_sector;
+		UINT chunk_size = (remaining > available) ? available : remaining;
+
+		// Copy decrypted data to output (starting from offset_in_sector)
+		memcpy(output, plaintext_buf + offset_in_sector, chunk_size);
+
+		*br += chunk_size;
+		output += chunk_size;
+		remaining -= chunk_size;
+		block_idx++;
+
+		// Update logical file pointer
+		fp->crypt_logical_fptr += chunk_size;
+
+		// After first sector, we're always aligned
+		offset_in_sector = 0;
+	}
+
+	return FR_OK;
+}
 /*-----------------------------------------------------------------------*/
 /* Read File                                                             */
 /*-----------------------------------------------------------------------*/
@@ -4007,6 +4159,205 @@ FRESULT f_read (
 
 
 #if !FF_FS_READONLY
+/*-----------------------------------------------------------------------*/
+/* Write Encrypted File                                                  */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_crypt_write (
+	FIL* fp,			/* Open file to be written */
+	const void* buff,	/* Data to be written */
+	UINT btw,			/* Number of bytes to write */
+	UINT* bw			/* Number of bytes written */
+)
+{
+	FATFS *fs;
+	FRESULT res;
+
+	*bw = 0;
+	res = validate(&fp->obj, &fs);
+	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) return res;
+
+	// Check if master key is loaded - return error if not
+	if (!fs->master_key_loaded) {
+		fprintf(stderr, "f_crypt_write: master key not loaded, cannot write encrypted file\n");
+		return FR_DENIED;
+	}
+
+	const BYTE *input = (const BYTE*)buff;
+	UINT remaining = btw;
+	*bw = 0;
+
+	UINT sector_size = SS(fs);
+
+	// Derive nonce from starting cluster
+	BYTE base_nonce[12];
+	fatcrypt_derive_file_nonce(fp->obj.sclust, base_nonce);
+
+	// crypt_logical_fptr tracks logical position in decrypted data
+	// Calculate starting block index and offset
+	DWORD block_idx = (DWORD)(fp->crypt_logical_fptr / sector_size);
+	UINT offset_in_sector = (UINT)(fp->crypt_logical_fptr % sector_size);
+
+	while (remaining > 0) {
+		BYTE plaintext_buf[FF_MAX_SS];
+		BYTE ciphertext_buf[FF_MAX_SS];
+		BYTE tag[16];
+		BYTE block_nonce[12];
+
+		// Calculate how much to write in this sector
+		UINT available = sector_size - offset_in_sector;
+		UINT chunk_size = (remaining > available) ? available : remaining;
+
+		// Determine if we need read-modify-write (partial sector update)
+		int partial_sector = (offset_in_sector != 0) || (chunk_size < sector_size);
+
+		// Calculate physical position for this block
+		// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
+		FSIZE_t sector_start = 8 + block_idx * (sector_size + 16);
+
+		if (partial_sector) {
+			// Need to read existing sector, modify it, and write back
+			// Seek to start of this sector
+			res = f_lseek(fp, sector_start);
+			if (res != FR_OK) {
+				return res;
+			}
+
+			// Read existing encrypted sector
+			UINT read_count;
+			res = f_read(fp, ciphertext_buf, sector_size, &read_count);
+			if (res != FR_OK) {
+				// Sector doesn't exist yet (writing past EOF), use zeros
+				memset(plaintext_buf, 0, sector_size);
+			} else if (read_count == sector_size) {
+				// Read tag
+				BYTE old_tag[16];
+				res = f_read(fp, old_tag, 16, &read_count);
+				if (res != FR_OK || read_count != 16) {
+					memset(plaintext_buf, 0, sector_size);
+				} else {
+					// Decrypt existing sector
+					memcpy(block_nonce, base_nonce, 12);
+					block_nonce[8] ^= (block_idx >> 24) & 0xFF;
+					block_nonce[9] ^= (block_idx >> 16) & 0xFF;
+					block_nonce[10] ^= (block_idx >> 8) & 0xFF;
+					block_nonce[11] ^= block_idx & 0xFF;
+
+					if (fatcrypt_decrypt_block(ciphertext_buf, sector_size,
+					                            fs->master_key, sizeof(fs->master_key),
+					                            block_nonce, sizeof(block_nonce),
+					                            NULL, 0, old_tag, plaintext_buf) != 0) {
+						// Decryption failed, use zeros
+						memset(plaintext_buf, 0, sector_size);
+					}
+				}
+			} else {
+				memset(plaintext_buf, 0, sector_size);
+			}
+
+			// Modify the plaintext buffer
+			memcpy(plaintext_buf + offset_in_sector, input, chunk_size);
+
+			// Seek back to write position
+			f_lseek(fp, sector_start);
+		} else {
+			// Full sector write, just use input data
+			memcpy(plaintext_buf, input, chunk_size);
+			// Pad if needed (shouldn't happen with our logic, but be safe)
+			if (chunk_size < sector_size) {
+				memset(plaintext_buf + chunk_size, 0, sector_size - chunk_size);
+			}
+		}
+
+		// Generate per-block nonce
+		memcpy(block_nonce, base_nonce, 12);
+		block_nonce[8] ^= (block_idx >> 24) & 0xFF;
+		block_nonce[9] ^= (block_idx >> 16) & 0xFF;
+		block_nonce[10] ^= (block_idx >> 8) & 0xFF;
+		block_nonce[11] ^= block_idx & 0xFF;
+
+		// Encrypt the block
+		if (fatcrypt_encrypt_block(plaintext_buf, sector_size,
+		                            fs->master_key, sizeof(fs->master_key),
+		                            block_nonce, sizeof(block_nonce),
+		                            NULL, 0,
+		                            ciphertext_buf, tag) != 0) {
+			return FR_INT_ERR;
+		}
+
+		// Write ciphertext
+		UINT written;
+		res = f_write(fp, ciphertext_buf, sector_size, &written);
+		if (res != FR_OK || written != sector_size) {
+			return res != FR_OK ? res : FR_INT_ERR;
+		}
+
+		// Write tag
+		res = f_write(fp, tag, 16, &written);
+		if (res != FR_OK || written != 16) {
+			return res != FR_OK ? res : FR_INT_ERR;
+		}
+
+		*bw += chunk_size;
+		input += chunk_size;
+		remaining -= chunk_size;
+		block_idx++;
+
+		// Update logical file pointer
+		fp->crypt_logical_fptr += chunk_size;
+
+		// After first sector, we're always aligned
+		offset_in_sector = 0;
+	}
+
+	// Update logical file size header at offset 0
+	FSIZE_t new_logical_size = fp->crypt_logical_fptr;
+
+	// Read current logical size
+	BYTE size_header[8];
+	res = f_lseek(fp, 0);
+	if (res != FR_OK) return res;
+
+	UINT header_read;
+	res = f_read(fp, size_header, 8, &header_read);
+	FSIZE_t current_logical_size = 0;
+	if (res == FR_OK && header_read == 8) {
+		// Parse current logical size (little-endian)
+		current_logical_size = ((FSIZE_t)size_header[0]) |
+		                       ((FSIZE_t)size_header[1] << 8) |
+		                       ((FSIZE_t)size_header[2] << 16) |
+		                       ((FSIZE_t)size_header[3] << 24) |
+		                       ((FSIZE_t)size_header[4] << 32) |
+		                       ((FSIZE_t)size_header[5] << 40) |
+		                       ((FSIZE_t)size_header[6] << 48) |
+		                       ((FSIZE_t)size_header[7] << 56);
+	}
+
+	// Only update if we extended the file
+	if (new_logical_size > current_logical_size) {
+		// Write new logical size (little-endian)
+		size_header[0] = (BYTE)(new_logical_size & 0xFF);
+		size_header[1] = (BYTE)((new_logical_size >> 8) & 0xFF);
+		size_header[2] = (BYTE)((new_logical_size >> 16) & 0xFF);
+		size_header[3] = (BYTE)((new_logical_size >> 24) & 0xFF);
+		size_header[4] = (BYTE)((new_logical_size >> 32) & 0xFF);
+		size_header[5] = (BYTE)((new_logical_size >> 40) & 0xFF);
+		size_header[6] = (BYTE)((new_logical_size >> 48) & 0xFF);
+		size_header[7] = (BYTE)((new_logical_size >> 56) & 0xFF);
+
+		res = f_lseek(fp, 0);
+		if (res != FR_OK) return res;
+
+		UINT header_written;
+		res = f_write(fp, size_header, 8, &header_written);
+		if (res != FR_OK || header_written != 8) {
+			return res != FR_OK ? res : FR_INT_ERR;
+		}
+	}
+
+	return FR_OK;
+}
+
 /*-----------------------------------------------------------------------*/
 /* Write File                                                            */
 /*-----------------------------------------------------------------------*/
@@ -4588,6 +4939,48 @@ FRESULT f_lseek (
 }
 
 
+/*-----------------------------------------------------------------------*/
+/* Seek Encrypted File (Logical Position)                                */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_crypt_lseek (
+	FIL* fp,				/* Pointer to the file object */
+	FSIZE_t logical_ofs		/* Logical file pointer from top of decrypted data */
+)
+{
+	FRESULT res;
+	FATFS *fs;
+	UINT sector_size;
+	FSIZE_t physical_ofs;
+
+	res = validate(&fp->obj, &fs);
+	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) return res;
+
+	// Can't encrypt if no master key
+	if (!fs->master_key_loaded) {
+		fprintf(stderr, "f_crypt_lseek: master key not loaded\n");
+		return FR_DENIED;
+	}
+
+	sector_size = SS(fs);
+
+	// Calculate physical offset from logical offset
+	// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
+	// Each logical sector of data requires (sector_size + 16) bytes physically
+	//
+	// Note: We always seek to the start of the sector that contains the logical offset.
+	// The offset within the sector is handled by f_crypt_read/write.
+
+	FSIZE_t sector_idx = logical_ofs / sector_size;
+	physical_ofs = 8 + sector_idx * (sector_size + 16);
+
+	// Store logical position
+	fp->crypt_logical_fptr = logical_ofs;
+
+	// Seek to physical position (start of sector)
+	return f_lseek(fp, physical_ofs);
+}
+
 
 #if FF_FS_MINIMIZE <= 1
 /*-----------------------------------------------------------------------*/
@@ -4953,6 +5346,73 @@ FRESULT f_truncate (
 }
 
 
+/*-----------------------------------------------------------------------*/
+/* Truncate Encrypted File                                               */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_crypt_truncate (
+	FIL* fp,				/* Pointer to the file object */
+	FSIZE_t logical_size	/* Logical size to truncate to (in decrypted bytes) */
+)
+{
+	FRESULT res;
+	FATFS *fs;
+	FSIZE_t physical_size;
+	UINT sector_size;
+
+	res = validate(&fp->obj, &fs);
+	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) return res;
+	if (!(fp->flag & FA_WRITE)) return FR_DENIED;
+
+	// Can't encrypt if no master key
+	if (!fs->master_key_loaded) {
+		fprintf(stderr, "f_crypt_truncate: master key not loaded\n");
+		return FR_DENIED;
+	}
+
+	sector_size = SS(fs);
+
+	// Calculate physical size for the given logical size
+	// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
+	// Each sector requires sector_size + 16 bytes
+	FSIZE_t num_sectors = (logical_size + sector_size - 1) / sector_size;  // Round up
+	physical_size = 8 + num_sectors * (sector_size + 16);
+
+	// Special case: truncating to zero keeps just the 8-byte header
+	if (logical_size == 0) {
+		physical_size = 8;
+	}
+
+	// Seek to the physical position
+	res = f_lseek(fp, physical_size);
+	if (res != FR_OK) return res;
+
+	// Truncate at this position
+	res = f_truncate(fp);
+	if (res != FR_OK) return res;
+
+	// Update the logical size header
+	BYTE size_header[8];
+	size_header[0] = (BYTE)(logical_size & 0xFF);
+	size_header[1] = (BYTE)((logical_size >> 8) & 0xFF);
+	size_header[2] = (BYTE)((logical_size >> 16) & 0xFF);
+	size_header[3] = (BYTE)((logical_size >> 24) & 0xFF);
+	size_header[4] = (BYTE)((logical_size >> 32) & 0xFF);
+	size_header[5] = (BYTE)((logical_size >> 40) & 0xFF);
+	size_header[6] = (BYTE)((logical_size >> 48) & 0xFF);
+	size_header[7] = (BYTE)((logical_size >> 56) & 0xFF);
+
+	res = f_lseek(fp, 0);
+	if (res != FR_OK) return res;
+
+	UINT header_written;
+	res = f_write(fp, size_header, 8, &header_written);
+	if (res != FR_OK || header_written != 8) {
+		return res != FR_OK ? res : FR_INT_ERR;
+	}
+
+	return FR_OK;
+}
 
 
 /*-----------------------------------------------------------------------*/
@@ -5029,6 +5489,28 @@ FRESULT f_unlink (
 				}
 			}
 			if (res == FR_OK) {
+				// Before deleting, check if this is an encrypted file and extract UUID for metadata cleanup
+				BYTE file_uuid[16];
+				int has_uuid = 0;
+				if (!(dj.obj.attr & AM_DIR) && fs->master_key_loaded) {
+					// Try to read file header to get UUID
+					FIL fp;
+					memset(&fp, 0, sizeof(fp));
+					if (f_open(&fp, path, FA_READ) == FR_OK) {
+						BYTE header_peek[512];
+						UINT br;
+						if (f_read(&fp, header_peek, sizeof(header_peek), &br) == FR_OK) {
+							if (fatcrypt_verify_header(header_peek, br) == 0) {
+								size_t header_size;
+								if (fatcrypt_read_header(header_peek, br, file_uuid, NULL, &header_size) == 0) {
+									has_uuid = 1;
+								}
+							}
+						}
+						f_close(&fp);
+					}
+				}
+
 				res = dir_remove(&dj);			/* Remove the directory entry */
 				if (res == FR_OK && dclst != 0) {	/* Remove the cluster chain if exist */
 #if FF_FS_EXFAT
@@ -5038,6 +5520,24 @@ FRESULT f_unlink (
 #endif
 				}
 				if (res == FR_OK) res = sync_fs(fs);
+
+				// Clean up metadata file if this was an encrypted file
+				if (res == FR_OK && has_uuid) {
+					// Convert UUID to hex string
+					char uuid_hex[33];
+					for (int i = 0; i < 16; i++) {
+						snprintf(uuid_hex + (i * 2), 3, "%02x", file_uuid[i]);
+					}
+					uuid_hex[32] = '\0';
+
+					// Build metadata path
+					char meta_path[2048];
+					snprintf(meta_path, sizeof(meta_path), "%s/.fat_crypt/meta/%s.json",
+					         fs->mountpoint_dir, uuid_hex);
+
+					// Delete metadata file (ignore errors - file might not exist)
+					remove(meta_path);
+				}
 			}
 		}
 		FREE_NAMBUF();

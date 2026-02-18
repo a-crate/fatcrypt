@@ -32,10 +32,12 @@
 #include <time.h>
 #include <stddef.h>
 #include <pthread.h>
+#include <termios.h>
 
 #include <ff.h>
 #include <fftable.h>
 #include <config.h>
+#include <fatcrypt.h>
 
 int fuse_reentrant_tag = 0;
 
@@ -140,6 +142,36 @@ static int fff_getattr(const char *path, struct stat *stbuf FUSE3_ONLY(, struct 
 		if (fres != FR_OK) goto err;
 		memset(stbuf, 0, sizeof(struct stat));
 		stbuf->st_size = fileinfo.fsize;
+
+		// For encrypted files (not directories, not metadata, not plaintext),
+		// read the logical file size from the 8-byte header
+		if (!(fileinfo.fattrib & AM_DIR) &&
+		    ffentry->fs.master_key_loaded &&
+		    !fatcrypt_is_metadata_path(path) &&
+		    !fatcrypt_is_plaintext_path(path, &ffentry->config.plaintext)) {
+			// Open file and read logical size header
+			FIL fp;
+			fres = f_open(&fp, fffpath, FA_READ);
+			if (fres == FR_OK && fileinfo.fsize >= 8) {
+				BYTE size_header[8];
+				UINT br;
+				fres = f_read(&fp, size_header, 8, &br);
+				if (fres == FR_OK && br == 8) {
+					// Parse logical size (little-endian)
+					FSIZE_t logical_size = ((FSIZE_t)size_header[0]) |
+					                       ((FSIZE_t)size_header[1] << 8) |
+					                       ((FSIZE_t)size_header[2] << 16) |
+					                       ((FSIZE_t)size_header[3] << 24) |
+					                       ((FSIZE_t)size_header[4] << 32) |
+					                       ((FSIZE_t)size_header[5] << 40) |
+					                       ((FSIZE_t)size_header[6] << 48) |
+					                       ((FSIZE_t)size_header[7] << 56);
+					stbuf->st_size = logical_size;
+				}
+				f_close(&fp);
+			}
+		}
+
 		stbuf->st_ctime = stbuf->st_mtime =
 			fftime2time(fileinfo.fdate, fileinfo.ftime);
 		if (fileinfo.fattrib & AM_DIR) {
@@ -203,9 +235,27 @@ static int fff_read(const char *path, char *buf, size_t size, off_t offset, stru
 	FRESULT fres = f_open(&fp, fffpath, flags2ffmode(fi->flags));
 	if (fres != FR_OK)
 		goto earlyerr;
-	fres = f_lseek(&fp, offset);
-	if (fres != FR_OK) goto err;
-	fres = f_read(&fp, buf, size, &br);
+
+	// Check if path is under .fat_crypt directory
+	int is_metadata = fatcrypt_is_metadata_path(path);
+	if (is_metadata < 0) {
+		// Path normalization error (path traversal attempt)
+		fres = FR_INVALID_NAME;
+		goto err;
+	}
+
+	// Use appropriate seek and read functions
+	// If master key was never loaded, always use unencrypted operations
+	if (!ffentry->fs.master_key_loaded || fatcrypt_is_metadata_path(path) || fatcrypt_is_plaintext_path(path, &ffentry->config.plaintext)) {
+		fres = f_lseek(&fp, offset);
+		if (fres != FR_OK) goto err;
+		fres = f_read(&fp, buf, size, &br);
+	} else {
+		fres = f_crypt_lseek(&fp, offset);
+		if (fres != FR_OK) goto err;
+		fres = f_crypt_read(&fp, buf, size, &br);
+	}
+
 	if (fres != FR_OK) goto err;
 	f_close(&fp);
 	mutex_out_return(br);
@@ -227,9 +277,18 @@ static int fff_write(const char *path, const char *buf, size_t size, off_t offse
 	FRESULT fres = f_open(&fp, fffpath, flags2ffmode(fi->flags));
 	if (fres != FR_OK)
 		goto earlyerr;
-	fres = f_lseek(&fp, offset);
-	if (fres != FR_OK) goto err;
-	fres = f_write(&fp, buf, size, &bw);
+
+	// If master key was never loaded, always use unencrypted operations
+	if (!ffentry->fs.master_key_loaded || fatcrypt_is_metadata_path(path) || fatcrypt_is_plaintext_path(path, &ffentry->config.plaintext)) {
+		fres = f_lseek(&fp, offset);
+		if (fres != FR_OK) goto err;
+		fres = f_write(&fp, buf, size, &bw);
+	} else {
+		fres = f_crypt_lseek(&fp, offset);
+		if (fres != FR_OK) goto err;
+		fres = f_crypt_write(&fp, buf, size, &bw);
+	}
+
 	if (fres != FR_OK) goto err;
 	fres = f_sync(&fp);
 	if (fres != FR_OK) goto err;
@@ -349,9 +408,18 @@ static int fff_truncate(const char *path, off_t size FUSE3_ONLY(, struct fuse_fi
 	memset(&fp, 0, sizeof(fp));
 	FRESULT fres = f_open(&fp, fffpath, FA_WRITE);
 	if (fres != FR_OK) goto openerr;
-	fres = f_lseek(&fp, size);
-	if (fres != FR_OK) goto err;
-	fres = f_truncate(&fp);
+
+	// Use unencrypted truncate for .fat_crypt paths and plaintext paths
+	// If master key was never loaded, always use unencrypted operations
+	if (!ffentry->fs.master_key_loaded || fatcrypt_is_metadata_path(path) || fatcrypt_is_plaintext_path(path, &ffentry->config.plaintext)) {
+		fres = f_lseek(&fp, size);
+		if (fres != FR_OK) goto err;
+		fres = f_truncate(&fp);
+	} else {
+		// Encrypted file - use f_crypt_truncate with logical size
+		fres = f_crypt_truncate(&fp, size);
+	}
+
 	if (fres != FR_OK) goto err;
 	fres = f_close(&fp);
 openerr:
@@ -418,7 +486,74 @@ static int fff_statfs(const char *path, struct statvfs *buf) {
   mutex_out_return(fr2errno(fres));
 }
 
-static struct fftab *fff_init(const char *source, int codepage, int flags) {
+// Helper function to prompt for passphrase if the master key is encrypted
+// Returns: passphrase in provided buffer, or NULL if not needed or failed
+static const char *fff_prompt_passphrase(const char *master_key_path, char *passphrase_buf, size_t buf_size) {
+	struct stat key_stat;
+	if (stat(master_key_path, &key_stat) != 0) {
+		fprintf(stderr, "Master key file not found: %s\n", master_key_path);
+		return NULL;
+	}
+
+	// Check if master key file is encrypted
+	FILE *f = fopen(master_key_path, "rb");
+	if (!f) {
+		fprintf(stderr, "Cannot open master key file: %s\n", master_key_path);
+		return NULL;
+	}
+
+	uint8_t header[10];
+	if (fread(header, 1, 10, f) != 10) {
+		fclose(f);
+		fprintf(stderr, "Master key file too short: %s\n", master_key_path);
+		return NULL;
+	}
+	fclose(f);
+
+	// Check encrypted flag (offset 9)
+	if (header[9] != 1) {
+		// Key is not encrypted, no passphrase needed
+		return NULL;
+	}
+
+	// Key is encrypted, prompt for passphrase
+	struct termios old_term, new_term;
+	FILE *tty = fopen("/dev/tty", "r+");
+	if (!tty) {
+		fprintf(stderr, "Cannot open /dev/tty for passphrase input\n");
+		return NULL;
+	}
+
+	fprintf(tty, "Enter passphrase to unlock encrypted filesystem: ");
+	fflush(tty);
+
+	// Disable echo
+	tcgetattr(fileno(tty), &old_term);
+	new_term = old_term;
+	new_term.c_lflag &= ~ECHO;
+	tcsetattr(fileno(tty), TCSANOW, &new_term);
+
+	// Read passphrase
+	const char *result = NULL;
+	if (fgets(passphrase_buf, buf_size, tty)) {
+		// Remove trailing newline
+		size_t len = strlen(passphrase_buf);
+		if (len > 0 && passphrase_buf[len-1] == '\n') {
+			passphrase_buf[len-1] = '\0';
+		}
+		result = passphrase_buf;
+	}
+
+	// Restore terminal
+	tcsetattr(fileno(tty), TCSANOW, &old_term);
+	fprintf(tty, "\n");
+	fclose(tty);
+
+	return result;
+}
+
+
+static struct fftab *fff_init(const char *source, const char *mountpoint, int codepage, int flags, const char *master_key_path, const char *crypt_config_path) {
 	int index = fftab_new(source, flags);
 	if (index >= 0) {
 		struct fftab *ffentry = fftab_get(index);
@@ -436,6 +571,67 @@ static struct fftab *fff_init(const char *source, int codepage, int flags) {
 			}
 		} else
 			f_setcp(FAT_DEFAULT_CODEPAGE);
+
+		// Store mountpoint directory for config access
+		snprintf(ffentry->mountpoint_dir, sizeof(ffentry->mountpoint_dir), "%s", mountpoint);
+		snprintf(ffentry->fs.mountpoint_dir, sizeof(ffentry->fs.mountpoint_dir), "%s", mountpoint);
+
+		// Initialize config with defaults (will be loaded if master key provided)
+		ffentry->config.version = 1;
+		ffentry->config.kdf.name = NULL;
+		ffentry->config.kdf.opslimit = 0;
+		ffentry->config.kdf.memlimit = 0;
+		ffentry->config.kdf.algorithm = 0;
+		ffentry->config.plaintext.files = NULL;
+		ffentry->config.plaintext.files_count = 0;
+		ffentry->config.plaintext.directories = NULL;
+		ffentry->config.plaintext.directories_count = 0;
+		ffentry->fs.master_key_loaded = 0;
+
+		// Only perform crypto initialization if master key path was provided
+		if (master_key_path != NULL) {
+			fprintf(stderr, "Initializing encryption with master key from: %s\n", master_key_path);
+
+			// Load config.json from FAT filesystem (includes plaintext configuration)
+			if (fatcrypt_load_config(crypt_config_path, &ffentry->config) != 0) {
+				fprintf(stderr, "Error: Could not load config.json from filesystem\n");
+				f_mount(0, sdrv, 1);
+				fftab_del(index);
+				return NULL;
+			}
+
+			// Prompt for passphrase if master key is encrypted
+			char passphrase_buf[256] = {0};
+			const char *passphrase = fff_prompt_passphrase(master_key_path, passphrase_buf, sizeof(passphrase_buf));
+
+			// Load master key from host filesystem (using already-loaded config)
+			if (fatcrypt_load_master_key(master_key_path, passphrase, &ffentry->config,
+			                              ffentry->fs.master_key,
+			                              sizeof(ffentry->fs.master_key)) != 0) {
+				fprintf(stderr, "Error: Could not load master key from %s\n", master_key_path);
+				// Clear passphrase from memory
+				if (passphrase) {
+					memset(passphrase_buf, 0, sizeof(passphrase_buf));
+				}
+				fatcrypt_free_config(&ffentry->config);
+				f_mount(0, sdrv, 1);
+				fftab_del(index);
+				return NULL;
+			}
+
+			ffentry->fs.master_key_loaded = 1;
+			fprintf(stderr, "Master key loaded successfully\n");
+
+			// Clear passphrase from memory after successful initialization
+			if (passphrase) {
+				memset(passphrase_buf, 0, sizeof(passphrase_buf));
+			}
+
+			fprintf(stderr, "Crypto initialization complete, filesystem ready for mount\n");
+		} else {
+			fprintf(stderr, "No master key provided, mounting without encryption\n");
+		}
+
 		return ffentry;
 	} else
 		return NULL;
@@ -444,7 +640,15 @@ static struct fftab *fff_init(const char *source, int codepage, int flags) {
 static void fff_destroy(struct fftab *ffentry) {
 	char sdrv[12];
 	snprintf(sdrv, 12, "%d:", ffentry->index);
+
+	// Clear master key from memory before unmount
+	if (ffentry->fs.master_key_loaded) {
+		memset(ffentry->fs.master_key, 0, sizeof(ffentry->fs.master_key));
+		ffentry->fs.master_key_loaded = 0;
+	}
+
 	f_mount(0, sdrv, 1);
+	fatcrypt_free_config(&ffentry->config);
 	fftab_del(ffentry->index);
 }
 
@@ -478,6 +682,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 			"usage: " PROGNAME " image mountpoint [options]\n"
+			"   or: " PROGNAME " keygen <directory> [options]\n"
 			"\n"
 			"general options:\n"
 			"    -o opt,[opt...]    mount options\n"
@@ -489,7 +694,16 @@ static void usage(void)
 			"    -o rw+    enable write support\n"
 			"    -o rw     enable write support only together with -force\n"
 			"    -o force  enable write support only together with -rw\n"
-			"    -o codepage=XXX  set codepage (default 850)\n"
+			"    -o codepage=XXX         set codepage (default 850)\n"
+			"    -k, --master-key PATH   path to master key (enables encryption)\n"
+			"    -o master_key=PATH      path to master key (alternative syntax)\n"
+			"\n"
+			"keygen options:\n"
+			"    -p, --passphrase=PASS      passphrase to protect master key\n"
+			"    -i, --interactive          prompt for passphrase interactively\n"
+			"    --3ds                      add 3DS-specific plaintext files (boot.firm, kernel.bin, luma/payloads/)\n"
+			"    --plaintext-file=PATH      add file to plaintext list (repeatable)\n"
+			"    --plaintext-dir=PATH       add directory to plaintext list (repeatable)\n"
 			"\n"
 			"    this software is still experimental\n"
 			"\n");
@@ -498,6 +712,8 @@ static void usage(void)
 struct options {
 	const char *source;
 	const char *mountpoint;
+	const char *master_key_path;
+	const char *crypt_config_path;
 	int ro;
 	int rw;
 	int rwplus;
@@ -514,6 +730,12 @@ static struct fuse_opt fff_opts[] =
 	FFF_OPT("rw+", rwplus, 1),
 	FFF_OPT("force", force, 1),
 	FFF_OPT("codepage=%u", codepage, 1),
+	FFF_OPT("master_key=%s", master_key_path, 0),
+	FFF_OPT("-k %s", master_key_path, 0),
+	FFF_OPT("--master-key %s", master_key_path, 0),
+	FFF_OPT("crypt_config=%s", crypt_config_path, 0),
+	FFF_OPT("-c %s", crypt_config_path, 0),
+	FFF_OPT("--crypt-config %s", crypt_config_path, 0),
 
 	FUSE_OPT_KEY("-V", 'V'),
 	FUSE_OPT_KEY("--version", 'V'),
@@ -558,6 +780,71 @@ fff_opt_proc(void *data, const char *arg, int key, struct fuse_args *outargs)
 
 int main(int argc, char *argv[])
 {
+	// Check for keygen subcommand
+	if (argc >= 2 && strcmp(argv[1], "keygen") == 0) {
+		fatcrypt_keygen_config_t config = {
+			.mountpoint_dir = NULL,
+			.passphrase = NULL,
+			.interactive = 0,
+			.use_3ds_defaults = 0,
+			.plaintext_files = NULL,
+			.plaintext_files_count = 0,
+			.plaintext_dirs = NULL,
+			.plaintext_dirs_count = 0
+		};
+
+		// Parse keygen options first
+		for (int i = 2; i < argc; i++) {
+			if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+				usage();
+				return 0;
+			} else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
+				config.interactive = 1;
+			} else if (strcmp(argv[i], "--3ds") == 0) {
+				config.use_3ds_defaults = 1;
+			} else if (strncmp(argv[i], "-p=", 3) == 0 || strncmp(argv[i], "--passphrase=", 13) == 0) {
+				config.passphrase = strchr(argv[i], '=') + 1;
+			} else if (strncmp(argv[i], "--plaintext-file=", 17) == 0) {
+				char *file = argv[i] + 17;
+				config.plaintext_files = realloc(config.plaintext_files,
+					sizeof(char*) * (config.plaintext_files_count + 1));
+				config.plaintext_files[config.plaintext_files_count++] = file;
+			} else if (strncmp(argv[i], "--plaintext-dir=", 16) == 0) {
+				char *dir = argv[i] + 16;
+				config.plaintext_dirs = realloc(config.plaintext_dirs,
+					sizeof(char*) * (config.plaintext_dirs_count + 1));
+				config.plaintext_dirs[config.plaintext_dirs_count++] = dir;
+			} else if (argv[i][0] != '-') {
+				// Non-option argument is the directory
+				if (config.mountpoint_dir == NULL) {
+					config.mountpoint_dir = argv[i];
+				} else {
+					fprintf(stderr, "Error: multiple directory arguments provided\n\n");
+					usage();
+					return -1;
+				}
+			} else {
+				fprintf(stderr, "Unknown keygen option: %s\n\n", argv[i]);
+				usage();
+				return -1;
+			}
+		}
+
+		// Validate directory was provided
+		if (config.mountpoint_dir == NULL) {
+			fprintf(stderr, "Error: keygen requires a directory argument\n\n");
+			usage();
+			free(config.plaintext_files);
+			free(config.plaintext_dirs);
+			return -1;
+		}
+
+		int ret = fatcrypt_keygen(&config);
+		free(config.plaintext_files);
+		free(config.plaintext_dirs);
+		return ret;
+	}
+
 	int err;
 	struct options options = {0};
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
@@ -596,8 +883,11 @@ int main(int argc, char *argv[])
 	}
 
 	if (options.ro) flags |= FFFF_RDONLY;
-	if ((ffentry = fff_init(options.source, options.codepage, flags)) == NULL) {
-		fprintf(stderr, "Fuse init error\n");
+
+	// Initialize filesystem with optional encryption
+	// If master_key_path is provided, crypto init will happen inside fff_init()
+	if ((ffentry = fff_init(options.source, options.mountpoint, options.codepage, flags, options.master_key_path, options.crypt_config_path)) == NULL) {
+		fprintf(stderr, "Filesystem initialization failed\n");
 		goto returnerr;
 	}
 	err = fuse_main(args.argc, args.argv, &fusefat_ops, ffentry);

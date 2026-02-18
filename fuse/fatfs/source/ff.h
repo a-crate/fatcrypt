@@ -171,6 +171,9 @@ typedef struct {
 #endif
 	LBA_t	winsect;		/* Current sector appearing in the win[] */
 	BYTE	win[FF_MAX_SS];	/* Disk access window for Directory, FAT (and file data at tiny cfg) */
+	BYTE	master_key[32];	/* Master key for encryption (256 bits) */
+	BYTE	master_key_loaded;	/* 1 if master key has been loaded, 0 otherwise */
+	char	mountpoint_dir[1024];	/* Mountpoint directory for .fat_crypt access */
 } FATFS;
 
 
@@ -207,6 +210,7 @@ typedef struct {
 	FSIZE_t	fptr;			/* File read/write pointer (Zeroed on file open) */
 	DWORD	clust;			/* Current cluster of fpter (invalid when fptr is 0) */
 	LBA_t	sect;			/* Sector number appearing in buf[] (0:invalid) */
+	FSIZE_t	crypt_logical_fptr;	/* Logical file pointer for encrypted files (position in decrypted data) */
 #if !FF_FS_READONLY
 	LBA_t	dir_sect;		/* Sector number containing the directory entry (not used at exFAT) */
 	BYTE*	dir_ptr;		/* Pointer to the directory entry in the win[] (not used at exFAT) */
@@ -291,7 +295,8 @@ typedef enum {
 	FR_LOCKED,				/* (16) The operation is rejected according to the file sharing policy */
 	FR_NOT_ENOUGH_CORE,		/* (17) LFN working buffer could not be allocated */
 	FR_TOO_MANY_OPEN_FILES,	/* (18) Number of open files > FF_FS_LOCK */
-	FR_INVALID_PARAMETER	/* (19) Given parameter is invalid */
+	FR_INVALID_PARAMETER,	/* (19) Given parameter is invalid */
+	FR_NO_HEADER			/* (20) missing encryption header. */
 } FRESULT;
 
 
@@ -303,10 +308,14 @@ typedef enum {
 
 FRESULT f_open (FIL* fp, const TCHAR* path, BYTE mode);				/* Open or create a file */
 FRESULT f_close (FIL* fp);											/* Close an open file object */
+FRESULT f_crypt_read (FIL* fp, void* buff, UINT btr, UINT* br);		/* Read data from possibly encyrypted file */
 FRESULT f_read (FIL* fp, void* buff, UINT btr, UINT* br);			/* Read data from the file */
+FRESULT f_crypt_write (FIL* fp, const void* buff, UINT btw, UINT* bw);	/* Write data to possibly encrypted file */
 FRESULT f_write (FIL* fp, const void* buff, UINT btw, UINT* bw);	/* Write data to the file */
 FRESULT f_lseek (FIL* fp, FSIZE_t ofs);								/* Move file pointer of the file object */
+FRESULT f_crypt_lseek (FIL* fp, FSIZE_t logical_ofs);				/* Move logical file pointer for encrypted file */
 FRESULT f_truncate (FIL* fp);										/* Truncate the file */
+FRESULT f_crypt_truncate (FIL* fp, FSIZE_t logical_size);				/* Truncate encrypted file to logical size */
 FRESULT f_sync (FIL* fp);											/* Flush cached data of the writing file */
 FRESULT f_opendir (DIR* dp, const TCHAR* path);						/* Open a directory */
 FRESULT f_closedir (DIR* dp);										/* Close an open directory */
@@ -421,6 +430,11 @@ void ff_mutex_give (int vol);		/* Unlock sync object */
 #define AM_DIR	0x10	/* Directory */
 #define AM_ARC	0x20	/* Archive */
 
+
+/* Encryption nonsense */
+
+// Minimum header: 8 (magic) + 1 (version) + 16 (UUID) + 12 (nonce) + 2 (aad_len) = 39 bytes
+#define FATCRYPT_MIN_HEADER_SIZE 39
 
 #ifdef __cplusplus
 }
