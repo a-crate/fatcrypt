@@ -137,41 +137,15 @@ static int fff_getattr(const char *path, struct stat *stbuf FUSE3_ONLY(, struct 
 	} else {
 		const char fffpath(ffentry->index, path);
 		FILINFO fileinfo;
-		fres = f_stat(fffpath, &fileinfo);
+		if (!ffentry->fs.master_key_loaded || fatcrypt_is_metadata_path(path) || fatcrypt_is_plaintext_path(path, &ffentry->config.plaintext)) {
+			fres = f_stat(fffpath, &fileinfo);
+		} else {
+			fres = f_crypt_stat(fffpath, &fileinfo);
+		}
 		//printf("getattr %s %s -> %d\n", path, fffpath, fres);
 		if (fres != FR_OK) goto err;
 		memset(stbuf, 0, sizeof(struct stat));
 		stbuf->st_size = fileinfo.fsize;
-
-		// For encrypted files (not directories, not metadata, not plaintext),
-		// read the logical file size from the 8-byte header
-		if (!(fileinfo.fattrib & AM_DIR) &&
-		    ffentry->fs.master_key_loaded &&
-		    !fatcrypt_is_metadata_path(path) &&
-		    !fatcrypt_is_plaintext_path(path, &ffentry->config.plaintext)) {
-			// Open file and read logical size header
-			FIL fp;
-			fres = f_open(&fp, fffpath, FA_READ);
-			if (fres == FR_OK && fileinfo.fsize >= 8) {
-				BYTE size_header[8];
-				UINT br;
-				fres = f_read(&fp, size_header, 8, &br);
-				if (fres == FR_OK && br == 8) {
-					// Parse logical size (little-endian)
-					FSIZE_t logical_size = ((FSIZE_t)size_header[0]) |
-					                       ((FSIZE_t)size_header[1] << 8) |
-					                       ((FSIZE_t)size_header[2] << 16) |
-					                       ((FSIZE_t)size_header[3] << 24) |
-					                       ((FSIZE_t)size_header[4] << 32) |
-					                       ((FSIZE_t)size_header[5] << 40) |
-					                       ((FSIZE_t)size_header[6] << 48) |
-					                       ((FSIZE_t)size_header[7] << 56);
-					stbuf->st_size = logical_size;
-				}
-				f_close(&fp);
-			}
-		}
-
 		stbuf->st_ctime = stbuf->st_mtime =
 			fftime2time(fileinfo.fdate, fileinfo.ftime);
 		if (fileinfo.fattrib & AM_DIR) {

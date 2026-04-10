@@ -5168,6 +5168,52 @@ FRESULT f_findfirst (
 
 #if FF_FS_MINIMIZE == 0
 /*-----------------------------------------------------------------------*/
+/* Get Encrypted File Status                                             */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_crypt_stat (
+	const TCHAR* path,	/* Pointer to the file path */
+	FILINFO* fno		/* Pointer to file information to return */
+)
+{
+	FRESULT res;
+	FIL fp;
+
+	res = f_stat(path, fno);
+	if (res != FR_OK) {
+		return res;
+	}
+
+	// Open file, read size from header
+	if (!(fno->fattrib & AM_DIR)) {
+		res = f_open(&fp, path, FA_READ);
+		if (res != FR_OK) {
+			f_close(&fp);
+			return res;
+		}
+
+		if (fno->fsize >= 8) {
+			BYTE size_header[8];
+			UINT br;
+			res = f_read(&fp, size_header, 8, &br);
+			if (res == FR_OK && br == 8) {
+				FSIZE_t lsize = ((FSIZE_t)size_header[0]) |
+					((FSIZE_t)size_header[1] << 8) |
+					((FSIZE_t)size_header[1] << 16) |
+		  			((FSIZE_t)size_header[1] << 24) |
+		    		((FSIZE_t)size_header[1] << 32) |
+		    		((FSIZE_t)size_header[1] << 40) |
+		    		((FSIZE_t)size_header[1] << 48) |
+		    		((FSIZE_t)size_header[1] << 56);
+				fno->fsize = lsize;
+			}
+		}
+		f_close(&fp);
+	}
+	return FR_OK;
+}
+
+/*-----------------------------------------------------------------------*/
 /* Get File Status                                                       */
 /*-----------------------------------------------------------------------*/
 
