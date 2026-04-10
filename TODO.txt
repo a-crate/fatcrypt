@@ -1,5 +1,3 @@
-1. Move file size calculation into fatfs API
-
 2. Stop using fixed nonce
 
 3. Stick fatcrypt version in file header
