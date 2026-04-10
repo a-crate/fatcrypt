@@ -1,0 +1,10 @@
+1. Move file size calculation into fatfs API
+
+2. Stop using fixed nonce
+
+3. Stick fatcrypt version in file header
+
+4. Derive per-file keys
+
+5. Use AAD
+
