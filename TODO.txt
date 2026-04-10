@@ -8,3 +8,4 @@
 
 5. Use AAD
 
+6. Remove all libsodium usage
