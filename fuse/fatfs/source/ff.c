@@ -24,7 +24,6 @@
 #include "diskio.h"		/* Declarations of device I/O functions */
 #include "fatcrypt.h"		/* FatCrypt encryption functions */
 #include <json-c/json.h>	/* JSON for metadata files */
-#include <sodium.h>		/* libsodium for crypto operations */
 
 
 /*--------------------------------------------------------------------------

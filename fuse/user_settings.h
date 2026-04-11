@@ -5,9 +5,11 @@
 
 /* Features we need */
 #define HAVE_HKDF
+#define HAVE_PBKDF2
 #define HAVE_AESGCM
 #define HAVE_AES_DECRYPT
 #define WOLFSSL_SHA256
+#define HAVE_ARGON2
 
 /* Features we don't need - disable to reduce code size */
 #define NO_DSA

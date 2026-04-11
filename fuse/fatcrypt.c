@@ -8,13 +8,15 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
-#include <sodium.h>
 #include <json-c/json.h>
 #include <fnmatch.h>
+#include <sodium.h>
+#include <wolfssl/wolfcrypt/pwdbased.h>
 #include <wolfssl/wolfcrypt/hmac.h>
 #include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/random.h>
+#include <wolfssl/wolfcrypt/blake2-impl.h>
 
 // Normalize a path by resolving . and .. components
 // Returns 0 on success, -1 on error (path traversal above root)
@@ -296,9 +298,8 @@ static int write_json_file(const char *path, const char *content) {
 	return 0;
 }
 
-// Store master key blob with optional Argon2id encryption
 static int store_master_key(const char *path, const uint8_t *key, size_t key_size,
-                            const char *passphrase, unsigned long long memlimit) {
+                            const char *passphrase, unsigned long long iterations) {
 	FILE *f = fopen(path, "wb");
 	if (!f) {
 		fprintf(stderr, "Failed to create master key file %s: %s\n", path, strerror(errno));
@@ -323,22 +324,15 @@ static int store_master_key(const char *path, const uint8_t *key, size_t key_siz
 	}
 
 	if (encrypted) {
-		// Argon2id key derivation
-		uint8_t salt[crypto_pwhash_SALTBYTES];
-		uint8_t derived_key[crypto_secretbox_KEYBYTES];
+		uint8_t salt[FATCRYPT_SALT_SIZE];
+		uint8_t derived_key[FATCRYPT_MASTER_KEY_SIZE];
 
 		// Generate random salt
-		randombytes_buf(salt, sizeof(salt));
+		fatcrypt_read_random_bytes(salt, sizeof(salt));
 
-		// Derive key from passphrase using Argon2id
-		// Using moderate opslimit with configurable memlimit
-		if (crypto_pwhash(derived_key, sizeof(derived_key),
-		                  passphrase, strlen(passphrase),
-		                  salt,
-		                  crypto_pwhash_OPSLIMIT_MODERATE,
-		                  memlimit,
-		                  crypto_pwhash_ALG_ARGON2ID13) != 0) {
-			fprintf(stderr, "Argon2id key derivation failed (out of memory)\n");
+		if (wc_PBKDF2(derived_key, (const unsigned char *)passphrase, strlen(passphrase),
+		                  salt, sizeof(salt), iterations, FATCRYPT_MASTER_KEY_SIZE, FATCRYPT_HASH_ALG) != 0) {
+			fprintf(stderr, "PBKDF2 key derivation failed\n");
 			fclose(f);
 			unlink(path);
 			return -1;
@@ -351,18 +345,18 @@ static int store_master_key(const char *path, const uint8_t *key, size_t key_siz
 
 		// Encrypt master key with derived key using crypto_secretbox (XSalsa20-Poly1305)
 		uint8_t nonce[crypto_secretbox_NONCEBYTES];
-		randombytes_buf(nonce, sizeof(nonce));
+		fatcrypt_read_random_bytes(nonce, sizeof(nonce));
 
 		uint8_t ciphertext[crypto_secretbox_MACBYTES + key_size];
 		if (crypto_secretbox_easy(ciphertext, key, key_size, nonce, derived_key) != 0) {
 			fprintf(stderr, "Encryption failed\n");
-			sodium_memzero(derived_key, sizeof(derived_key));
+			secure_zero_memory(derived_key, sizeof(derived_key));
 			fclose(f);
 			unlink(path);
 			return -1;
 		}
 
-		sodium_memzero(derived_key, sizeof(derived_key));
+		secure_zero_memory(derived_key, sizeof(derived_key));
 
 		// Write nonce
 		if (fwrite(nonce, 1, sizeof(nonce), f) != sizeof(nonce)) {
@@ -451,32 +445,14 @@ int fatcrypt_load_config(const char *config_path, fatcrypt_config_t *config) {
 	}
 	config->kdf.name = strdup(json_object_get_string(kdf_name_obj));
 
-	struct json_object *opslimit_obj;
-	if (!json_object_object_get_ex(kdf_obj, "opslimit", &opslimit_obj)) {
-		fprintf(stderr, "config.json kdf missing 'opslimit' field\n");
+	struct json_object *iterations_obj;
+	if (!json_object_object_get_ex(kdf_obj, "iterations", &iterations_obj)) {
+		fprintf(stderr, "config.json kdf missing 'iterations' field\n");
 		free(config->kdf.name);
 		json_object_put(root);
 		return -1;
 	}
-	config->kdf.opslimit = json_object_get_uint64(opslimit_obj);
-
-	struct json_object *memlimit_obj;
-	if (!json_object_object_get_ex(kdf_obj, "memlimit", &memlimit_obj)) {
-		fprintf(stderr, "config.json kdf missing 'memlimit' field\n");
-		free(config->kdf.name);
-		json_object_put(root);
-		return -1;
-	}
-	config->kdf.memlimit = json_object_get_uint64(memlimit_obj);
-
-	struct json_object *algorithm_obj;
-	if (!json_object_object_get_ex(kdf_obj, "algorithm", &algorithm_obj)) {
-		fprintf(stderr, "config.json kdf missing 'algorithm' field\n");
-		free(config->kdf.name);
-		json_object_put(root);
-		return -1;
-	}
-	config->kdf.algorithm = json_object_get_int(algorithm_obj);
+	config->kdf.iterations = json_object_get_uint64(iterations_obj);
 
 	// Parse plaintext (optional)
 	struct json_object *plaintext_obj;
@@ -548,12 +524,6 @@ void fatcrypt_free_config(fatcrypt_config_t *config) {
 int fatcrypt_sign_config(const char *mountpoint_dir, const uint8_t *master_key, size_t key_size) {
 	if (key_size != FATCRYPT_MASTER_KEY_SIZE) {
 		fprintf(stderr, "Invalid key size for signing\n");
-		return -1;
-	}
-
-	// Initialize libsodium
-	if (sodium_init() < 0) {
-		fprintf(stderr, "Failed to initialize libsodium\n");
 		return -1;
 	}
 
@@ -635,12 +605,6 @@ int fatcrypt_verify_config(const char *mountpoint_dir, const uint8_t *master_key
 		return -1;
 	}
 
-	// Initialize libsodium
-	if (sodium_init() < 0) {
-		fprintf(stderr, "Failed to initialize libsodium\n");
-		return -1;
-	}
-
 	// Read config.json
 	char config_path[1024];
 	snprintf(config_path, sizeof(config_path), "%s/.fat_crypt/config.json", mountpoint_dir);
@@ -715,12 +679,6 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
                         uint8_t *key_out, size_t key_size) {
 	if (key_size != FATCRYPT_MASTER_KEY_SIZE) {
 		fprintf(stderr, "Invalid key size: %zu (expected %d)\n", key_size, FATCRYPT_MASTER_KEY_SIZE);
-		return -1;
-	}
-
-	// Initialize libsodium
-	if (sodium_init() < 0) {
-		fprintf(stderr, "Failed to initialize libsodium\n");
 		return -1;
 	}
 
@@ -832,9 +790,9 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 	if (crypto_pwhash(derived_key, sizeof(derived_key),
 	                  passphrase, strlen(passphrase),
 	                  salt,
-	                  config->kdf.opslimit,
-	                  config->kdf.memlimit,
-	                  config->kdf.algorithm) != 0) {
+	                  config->kdf.iterations,
+	                  config->kdf.iterations,
+	                  config->kdf.iterations) != 0) {
 		fprintf(stderr, "Key derivation failed (out of memory)\n");
 		return -1;
 	}
@@ -843,11 +801,11 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 	if (crypto_secretbox_open_easy(key_out, ciphertext, sizeof(ciphertext),
 	                                nonce, derived_key) != 0) {
 		fprintf(stderr, "Decryption failed (wrong passphrase or corrupted data)\n");
-		sodium_memzero(derived_key, sizeof(derived_key));
+		secure_zero_memory(derived_key, sizeof(derived_key));
 		return -1;
 	}
 
-	sodium_memzero(derived_key, sizeof(derived_key));
+	secure_zero_memory(derived_key, sizeof(derived_key));
 	return 0;
 }
 
@@ -1224,12 +1182,6 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 	char passphrase_buf[256] = {0};
 	const char *passphrase = config->passphrase;
 
-	// Initialize libsodium
-	if (sodium_init() < 0) {
-		fprintf(stderr, "Failed to initialize libsodium\n");
-		return -1;
-	}
-
 	printf("FatCrypt Key Generation\n");
 	printf("=======================\n\n");
 
@@ -1249,7 +1201,7 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 						return -1;
 					}
 				}
-				sodium_memzero(confirm_buf, sizeof(confirm_buf));
+				secure_zero_memory(confirm_buf, sizeof(confirm_buf));
 			}
 		}
 	}
@@ -1278,11 +1230,8 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 		goto cleanup;
 	}
 
-	// Determine Argon2id memory limit based on target platform
-	// Use 64MB memory limit for 3DS (limited RAM), 256MB otherwise
-	unsigned long long memlimit = config->use_3ds_defaults ? 67108864ULL : crypto_pwhash_MEMLIMIT_MODERATE;
+	unsigned long long iterations = config->use_3ds_defaults ? FATCRYPT_3DS_ITERATIONS : FATCRYPT_ITERATIONS;
 
-	// Write config.json with Argon2id parameters and plaintext configuration
 	printf("Writing config.json...\n");
 	snprintf(path_buf, sizeof(path_buf), "%s/.fat_crypt/config.json", config->mountpoint_dir);
 
@@ -1292,10 +1241,8 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 
 	// Add KDF section
 	struct json_object *kdf = json_object_new_object();
-	json_object_object_add(kdf, "name", json_object_new_string("argon2id"));
-	json_object_object_add(kdf, "opslimit", json_object_new_uint64(crypto_pwhash_OPSLIMIT_MODERATE));
-	json_object_object_add(kdf, "memlimit", json_object_new_uint64(memlimit));
-	json_object_object_add(kdf, "algorithm", json_object_new_int(crypto_pwhash_ALG_ARGON2ID13));
+	json_object_object_add(kdf, "name", json_object_new_string("pbkdf2"));
+	json_object_object_add(kdf, "iterations", json_object_new_uint64(iterations));
 	json_object_object_add(root, "kdf", kdf);
 
 	// Add plaintext section
@@ -1335,7 +1282,7 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 	// Store master key at .fat_crypt/keys/master.blob
 	snprintf(master_key_path, sizeof(master_key_path), "%s/.fat_crypt/keys/master.blob", config->mountpoint_dir);
 	printf("Storing master key to %s...\n", master_key_path);
-	if (store_master_key(master_key_path, master_key, FATCRYPT_MASTER_KEY_SIZE, passphrase, memlimit) != 0) {
+	if (store_master_key(master_key_path, master_key, FATCRYPT_MASTER_KEY_SIZE, passphrase, iterations) != 0) {
 		goto cleanup;
 	}
 
@@ -1355,12 +1302,12 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 	printf("     to load the generated key and encrypt newly written files.\n");
 
 	// Clear sensitive data
-	sodium_memzero(master_key, sizeof(master_key));
-	sodium_memzero(passphrase_buf, sizeof(passphrase_buf));
+	secure_zero_memory(master_key, sizeof(master_key));
+	secure_zero_memory(passphrase_buf, sizeof(passphrase_buf));
 	return 0;
 
 cleanup:
-	sodium_memzero(master_key, sizeof(master_key));
-	sodium_memzero(passphrase_buf, sizeof(passphrase_buf));
+	secure_zero_memory(master_key, sizeof(master_key));
+	secure_zero_memory(passphrase_buf, sizeof(passphrase_buf));
 	return -1;
 }

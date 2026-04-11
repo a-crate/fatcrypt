@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+//#include <wolfssl/wolfcrypt/sha256.h>
 
 #define FATCRYPT_MAGIC "FATCRYPT"
 #define FATCRYPT_VERSION 0x01
@@ -12,6 +13,9 @@
 #define FATCRYPT_TAG_SIZE 16         // 128 bits for GCM
 #define FATCRYPT_UUID_SIZE 16        // 128 bits
 #define FATCRYPT_SALT_SIZE 16        // 128 bits for Argon2
+#define FATCRYPT_HASH_ALG WC_SHA256
+#define FATCRYPT_3DS_ITERATIONS 1500
+#define FATCRYPT_ITERATIONS 100000
 
 // Master key blob magic
 #define FATCRYPT_MASTER_MAGIC "FCMASTER"
@@ -42,9 +46,7 @@ typedef struct {
 // KDF configuration from config.json
 typedef struct {
 	char *name;                 // KDF name (e.g., "argon2id")
-	unsigned long long opslimit;
-	unsigned long long memlimit;
-	int algorithm;              // Algorithm identifier
+	unsigned long long iterations;
 } fatcrypt_kdf_config_t;
 
 // Plaintext file/directory patterns

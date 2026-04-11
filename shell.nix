@@ -5,8 +5,8 @@ mkShell {
     cmake
     pkgconf
     fuse3
-    libsodium
     json_c
+    libsodium
   ];
 
   shellHook = ''
