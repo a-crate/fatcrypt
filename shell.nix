@@ -6,7 +6,6 @@ mkShell {
     pkgconf
     fuse3
     json_c
-    libsodium
   ];
 
   shellHook = ''

@@ -16,7 +16,6 @@ if(NOT FUSE_FOUND)
 endif()
 string(REGEX REPLACE "\\..*" "" FUSE_VERSION ${FUSE_VERSION})
 
-pkg_check_modules(SODIUM REQUIRED libsodium)
 pkg_check_modules(JSON_C REQUIRED json-c)
 
 # Add vendored wolfSSL
