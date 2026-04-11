@@ -565,8 +565,8 @@ int fatcrypt_sign_config(const char *mountpoint_dir, const uint8_t *master_key, 
 	fclose(f);
 
 	// Compute SHA256 hash
-	uint8_t hash[crypto_hash_sha256_BYTES];
-	crypto_hash_sha256(hash, config_data, file_size);
+	uint8_t hash[WC_SHA256_DIGEST_SIZE];
+	wc_Sha256Hash(config_data, file_size, hash);
 	free(config_data);
 
 	// Compute HMAC of the hash using master key
@@ -643,8 +643,8 @@ int fatcrypt_verify_config(const char *mountpoint_dir, const uint8_t *master_key
 	fclose(f);
 
 	// Compute SHA256 hash
-	uint8_t hash[crypto_hash_sha256_BYTES];
-	crypto_hash_sha256(hash, config_data, file_size);
+	uint8_t hash[WC_SHA256_DIGEST_SIZE];
+	wc_Sha256Hash(config_data, file_size, hash);
 	free(config_data);
 
 	// Read signature from config.sig
