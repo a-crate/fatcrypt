@@ -344,7 +344,7 @@ static int store_master_key(const char *path, const uint8_t *key, size_t key_siz
 		}
 
 		// Encrypt master key with derived key using crypto_secretbox (XSalsa20-Poly1305)
-		uint8_t nonce[crypto_secretbox_NONCEBYTES];
+		uint8_t nonce[FATCRYPT_KEY_NONCE_SIZE];
 		fatcrypt_read_random_bytes(nonce, sizeof(nonce));
 
 		uint8_t ciphertext[crypto_secretbox_MACBYTES + key_size];
@@ -746,7 +746,7 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 	}
 
 	// Read salt
-	uint8_t salt[crypto_pwhash_SALTBYTES];
+	uint8_t salt[FATCRYPT_SALT_SIZE];
 	if (fread(salt, 1, sizeof(salt), f) != sizeof(salt)) {
 		fprintf(stderr, "Failed to read salt\n");
 		fclose(f);
@@ -754,7 +754,7 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 	}
 
 	// Read nonce
-	uint8_t nonce[crypto_secretbox_NONCEBYTES];
+	uint8_t nonce[FATCRYPT_KEY_NONCE_SIZE];
 	if (fread(nonce, 1, sizeof(nonce), f) != sizeof(nonce)) {
 		fprintf(stderr, "Failed to read nonce\n");
 		fclose(f);
