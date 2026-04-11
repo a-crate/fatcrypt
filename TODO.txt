@@ -6,6 +6,4 @@
 
 * Use AAD
 
-* AES-GCM -> XChaCha20-Poly1305 for file encryption
-
 * PBKDF2 -> scrypt for password encryption

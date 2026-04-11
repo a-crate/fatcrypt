@@ -30,7 +30,6 @@ set(WOLFSSL_SOURCES
 	${WOLFSSL_DIR}/wolfcrypt/src/hash.c
 	${WOLFSSL_DIR}/wolfcrypt/src/kdf.c
 	${WOLFSSL_DIR}/wolfcrypt/src/pwdbased.c
-	${WOLFSSL_DIR}/wolfcrypt/src/aes.c
 	${WOLFSSL_DIR}/wolfcrypt/src/random.c
 	${WOLFSSL_DIR}/wolfcrypt/src/wc_port.c
 	${WOLFSSL_DIR}/wolfcrypt/src/memory.c

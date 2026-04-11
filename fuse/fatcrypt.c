@@ -874,114 +874,59 @@ void fatcrypt_derive_file_nonce(uint32_t sclust, uint8_t *nonce_out) {
 }
 
 // Encrypt a block of data using XChaCha20-Poly1305
-// ciphertext_out must have space for plaintext_len bytes
-// tag_out must have space for FATCRYPT_TAG_SIZE (16) bytes
 int fatcrypt_encrypt_block(const uint8_t *plaintext, size_t plaintext_len,
                             const uint8_t *key, size_t key_len,
                             const uint8_t *nonce, size_t nonce_len,
                             const uint8_t *aad, size_t aad_len,
                             uint8_t *ciphertext_out, uint8_t *tag_out) {
-	if (!plaintext || !key || !nonce || !ciphertext_out || !tag_out) {
+	uint8_t tmp_out[XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE+plaintext_len];
+	if (!plaintext || !key || !nonce || !ciphertext_out) {
 		fprintf(stderr, "Invalid parameters for encrypt_block\n");
 		return -1;
 	}
 
-	if (key_len != 32) {
-		fprintf(stderr, "Invalid key size for AES-256-GCM: %zu\n", key_len);
+	if (wc_XChaCha20Poly1305_Encrypt(
+		tmp_out, plaintext_len+XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
+		plaintext, plaintext_len,
+		aad, aad_len,
+		nonce, nonce_len,
+		key, key_len
+	) != 0) {
 		return -1;
 	}
-
-	if (nonce_len != FATCRYPT_NONCE_SIZE) {
-		fprintf(stderr, "Invalid nonce size: %zu (expected %d)\n", nonce_len, FATCRYPT_NONCE_SIZE);
-		return -1;
-	}
-
-	Aes aes;
-	int ret;
-
-	// Initialize AES-GCM
-	ret = wc_AesInit(&aes, NULL, INVALID_DEVID);
-	if (ret != 0) {
-		fprintf(stderr, "wc_AesInit failed: %d\n", ret);
-		return -1;
-	}
-
-	// Set key
-	ret = wc_AesGcmSetKey(&aes, key, key_len);
-	if (ret != 0) {
-		fprintf(stderr, "wc_AesGcmSetKey failed: %d\n", ret);
-		wc_AesFree(&aes);
-		return -1;
-	}
-
-	// Encrypt
-	ret = wc_AesGcmEncrypt(&aes, ciphertext_out, plaintext, plaintext_len,
-	                       nonce, nonce_len, tag_out, FATCRYPT_TAG_SIZE,
-	                       aad, aad_len);
-	if (ret != 0) {
-		fprintf(stderr, "wc_AesGcmEncrypt failed: %d\n", ret);
-		wc_AesFree(&aes);
-		return -1;
-	}
-
-	wc_AesFree(&aes);
+	// layout: ciphertext[plaintext_len], tag[tag_len]
+	// this is stupid but I don't want to rewrite the block
+	// handling code so I'm just going to split the tag here
+	memcpy(ciphertext_out, tmp_out, plaintext_len);
+	memcpy(tag_out, tmp_out+plaintext_len, XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 	return 0;
 }
 
 // Decrypt a block of data using XChaCha20-Poly1305
-// plaintext_out must have space for ciphertext_len bytes
-// Returns 0 on success, -1 on failure (including auth tag mismatch)
 int fatcrypt_decrypt_block(const uint8_t *ciphertext, size_t ciphertext_len,
+                            const uint8_t *tag,
                             const uint8_t *key, size_t key_len,
                             const uint8_t *nonce, size_t nonce_len,
                             const uint8_t *aad, size_t aad_len,
-                            const uint8_t *tag,
                             uint8_t *plaintext_out) {
-	if (!ciphertext || !key || !nonce || !tag || !plaintext_out) {
+	uint8_t tmp_in[XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE+ciphertext_len];
+	if (!ciphertext || !key || !nonce || !plaintext_out) {
 		fprintf(stderr, "Invalid parameters for decrypt_block\n");
 		return -1;
 	}
 
-	if (key_len != 32) {
-		fprintf(stderr, "Invalid key size for AES-256-GCM: %zu\n", key_len);
-		return -1;
-	}
-
-	if (nonce_len != FATCRYPT_NONCE_SIZE) {
-		fprintf(stderr, "Invalid nonce size: %zu (expected %d)\n", nonce_len, FATCRYPT_NONCE_SIZE);
-		return -1;
-	}
-
-	Aes aes;
-	int ret;
-
-	// Initialize AES-GCM
-	ret = wc_AesInit(&aes, NULL, INVALID_DEVID);
-	if (ret != 0) {
-		fprintf(stderr, "wc_AesInit failed: %d\n", ret);
-		return -1;
-	}
-
-	// Set key
-	ret = wc_AesGcmSetKey(&aes, key, key_len);
-	if (ret != 0) {
-		fprintf(stderr, "wc_AesGcmSetKey failed: %d\n", ret);
-		wc_AesFree(&aes);
-		return -1;
-	}
-
-	// Decrypt and verify
-	ret = wc_AesGcmDecrypt(&aes, plaintext_out, ciphertext, ciphertext_len,
-	                       nonce, nonce_len, tag, FATCRYPT_TAG_SIZE,
-	                       aad, aad_len);
-	if (ret != 0) {
-		fprintf(stderr, "wc_AesGcmDecrypt failed (auth tag mismatch or error): %d\n", ret);
-		wc_AesFree(&aes);
-		return -1;
-	}
-
-	wc_AesFree(&aes);
-	return 0;
+	// layout: ciphertext[plaintext_len], tag[tag_len]
+	// this is stupid but I don't want to rewrite the block
+	// handling code so I'm just going to merge the tag here
+	memcpy(tmp_in, ciphertext, ciphertext_len);
+	memcpy(tmp_in+ciphertext_len, tag, XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
+	return wc_XChaCha20Poly1305_Decrypt(
+		plaintext_out, ciphertext_len,
+		tmp_in, ciphertext_len+XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
+		aad, aad_len,
+		nonce, nonce_len,
+		key, key_len
+	);
 }
 
 int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {

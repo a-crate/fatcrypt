@@ -8,20 +8,21 @@
 #define FATCRYPT_MAGIC "FATCRYPT"
 #define FATCRYPT_VERSION 0x01
 
-// file encryption
-#define FATCRYPT_NONCE_SIZE 12       // 96 bits for GCM
-#define FATCRYPT_TAG_SIZE 16         // 128 bits for GCM
-#define FATCRYPT_UUID_SIZE 16        // 128 bits
-
 // key derivation for master key password
 #define FATCRYPT_HASH_ALG WC_SHA256
 #define FATCRYPT_3DS_ITERATIONS 1500
 #define FATCRYPT_ITERATIONS 100000
 #define FATCRYPT_SALT_SIZE 16        // 128 bits for pbkdf2
 
+// master key
 #define CHACHA20_POLY1305_AEAD_NONCE_SIZE 12
 #define CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE 16
 #define CHACHA20_POLY1305_AEAD_KEYSIZE 32
+
+// file encryption
+#define XCHACHA20_POLY1305_AEAD_NONCE_SIZE 24
+#define XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE 16
+#define XCHACHA20_POLY1305_AEAD_KEYSIZE 32
 
 // Master key blob magic
 #define FATCRYPT_MASTER_MAGIC "FCMASTER"
@@ -89,10 +90,10 @@ int fatcrypt_encrypt_block(const uint8_t *plaintext, size_t plaintext_len,
                             const uint8_t *aad, size_t aad_len,
                             uint8_t *ciphertext_out, uint8_t *tag_out);
 int fatcrypt_decrypt_block(const uint8_t *ciphertext, size_t ciphertext_len,
+                            const uint8_t *tag,
                             const uint8_t *key, size_t key_len,
                             const uint8_t *nonce, size_t nonce_len,
                             const uint8_t *aad, size_t aad_len,
-                            const uint8_t *tag,
                             uint8_t *plaintext_out);
 
 #endif // FATCRYPT_H

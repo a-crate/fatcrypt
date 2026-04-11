@@ -3976,7 +3976,7 @@ FRESULT f_crypt_read (
 	btr = remaining;  // Update btr to reflect limited read
 
 	// Derive nonce from starting cluster
-	BYTE base_nonce[12];
+	BYTE base_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
 	fatcrypt_derive_file_nonce(fp->obj.sclust, base_nonce);
 
 	// crypt_logical_fptr tracks logical position in decrypted data
@@ -3987,12 +3987,12 @@ FRESULT f_crypt_read (
 	while (remaining > 0) {
 		BYTE ciphertext_buf[FF_MAX_SS];
 		BYTE plaintext_buf[FF_MAX_SS];
-		BYTE tag[16];
-		BYTE block_nonce[12];
+		BYTE tag[XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE];
+		BYTE block_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
 
 		// Calculate physical position for this block
 		// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
-		FSIZE_t physical_pos = 8 + block_idx * (sector_size + 16);
+		FSIZE_t physical_pos = 8 + block_idx * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 
 		// Seek to physical position
 		res = f_lseek(fp, physical_pos);
@@ -4000,7 +4000,7 @@ FRESULT f_crypt_read (
 			return res;
 		}
 
-		// Read ciphertext sector
+		// Read ciphertext
 		UINT read_count;
 		res = f_read(fp, ciphertext_buf, sector_size, &read_count);
 		if (res != FR_OK) {
@@ -4011,27 +4011,26 @@ FRESULT f_crypt_read (
 		}
 
 		// Read tag
-		res = f_read(fp, tag, 16, &read_count);
+		res = f_read(fp, tag, XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE, &read_count);
 		if (res != FR_OK) {
 			return res;
 		}
-		if (read_count != 16) {
-			return FR_INT_ERR;
-		}
+		if (read_count != XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE) {
+ 			return FR_INT_ERR;
+ 		}
 
 		// Generate per-block nonce: base_nonce XOR block_index
-		memcpy(block_nonce, base_nonce, 12);
+		memcpy(block_nonce, base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
 		block_nonce[8] ^= (block_idx >> 24) & 0xFF;
 		block_nonce[9] ^= (block_idx >> 16) & 0xFF;
 		block_nonce[10] ^= (block_idx >> 8) & 0xFF;
 		block_nonce[11] ^= block_idx & 0xFF;
 
 		// Decrypt the block
-		if (fatcrypt_decrypt_block(ciphertext_buf, sector_size,
+		if (fatcrypt_decrypt_block(ciphertext_buf, sector_size, tag,
 		                            fs->master_key, sizeof(fs->master_key),
 		                            block_nonce, sizeof(block_nonce),
 		                            NULL, 0,
-		                            tag,
 		                            plaintext_buf) != 0) {
 			return FR_INT_ERR;
 		}
@@ -4189,7 +4188,7 @@ FRESULT f_crypt_write (
 	UINT sector_size = SS(fs);
 
 	// Derive nonce from starting cluster
-	BYTE base_nonce[12];
+	BYTE base_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
 	fatcrypt_derive_file_nonce(fp->obj.sclust, base_nonce);
 
 	// crypt_logical_fptr tracks logical position in decrypted data
@@ -4200,8 +4199,8 @@ FRESULT f_crypt_write (
 	while (remaining > 0) {
 		BYTE plaintext_buf[FF_MAX_SS];
 		BYTE ciphertext_buf[FF_MAX_SS];
-		BYTE tag[16];
-		BYTE block_nonce[12];
+		BYTE tag[XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE];
+		BYTE block_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
 
 		// Calculate how much to write in this sector
 		UINT available = sector_size - offset_in_sector;
@@ -4212,7 +4211,7 @@ FRESULT f_crypt_write (
 
 		// Calculate physical position for this block
 		// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
-		FSIZE_t sector_start = 8 + block_idx * (sector_size + 16);
+		FSIZE_t sector_start = 8 + block_idx * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 
 		if (partial_sector) {
 			// Need to read existing sector, modify it, and write back
@@ -4233,8 +4232,8 @@ FRESULT f_crypt_write (
 				BYTE old_tag[16];
 				res = f_read(fp, old_tag, 16, &read_count);
 				if (res != FR_OK || read_count != 16) {
-					memset(plaintext_buf, 0, sector_size);
-				} else {
+	 					memset(plaintext_buf, 0, sector_size);
+	 			} else {
 					// Decrypt existing sector
 					memcpy(block_nonce, base_nonce, 12);
 					block_nonce[8] ^= (block_idx >> 24) & 0xFF;
@@ -4242,10 +4241,10 @@ FRESULT f_crypt_write (
 					block_nonce[10] ^= (block_idx >> 8) & 0xFF;
 					block_nonce[11] ^= block_idx & 0xFF;
 
-					if (fatcrypt_decrypt_block(ciphertext_buf, sector_size,
+					if (fatcrypt_decrypt_block(ciphertext_buf, sector_size, old_tag,
 					                            fs->master_key, sizeof(fs->master_key),
 					                            block_nonce, sizeof(block_nonce),
-					                            NULL, 0, old_tag, plaintext_buf) != 0) {
+					                            NULL, 0, plaintext_buf) != 0) {
 						// Decryption failed, use zeros
 						memset(plaintext_buf, 0, sector_size);
 					}
@@ -4269,7 +4268,7 @@ FRESULT f_crypt_write (
 		}
 
 		// Generate per-block nonce
-		memcpy(block_nonce, base_nonce, 12);
+		memcpy(block_nonce, base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
 		block_nonce[8] ^= (block_idx >> 24) & 0xFF;
 		block_nonce[9] ^= (block_idx >> 16) & 0xFF;
 		block_nonce[10] ^= (block_idx >> 8) & 0xFF;
@@ -4292,10 +4291,10 @@ FRESULT f_crypt_write (
 		}
 
 		// Write tag
-		res = f_write(fp, tag, 16, &written);
-		if (res != FR_OK || written != 16) {
-			return res != FR_OK ? res : FR_INT_ERR;
-		}
+		res = f_write(fp, tag, XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE, &written);
+		if (res != FR_OK || written != XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE) {
+ 			return res != FR_OK ? res : FR_INT_ERR;
+ 		}
 
 		*bw += chunk_size;
 		input += chunk_size;
@@ -4971,7 +4970,7 @@ FRESULT f_crypt_lseek (
 	// The offset within the sector is handled by f_crypt_read/write.
 
 	FSIZE_t sector_idx = logical_ofs / sector_size;
-	physical_ofs = 8 + sector_idx * (sector_size + 16);
+	physical_ofs = 8 + sector_idx * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 
 	// Store logical position
 	fp->crypt_logical_fptr = logical_ofs;
@@ -5421,7 +5420,7 @@ FRESULT f_crypt_truncate (
 	// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
 	// Each sector requires sector_size + 16 bytes
 	FSIZE_t num_sectors = (logical_size + sector_size - 1) / sector_size;  // Round up
-	physical_size = 8 + num_sectors * (sector_size + 16);
+	physical_size = 8 + num_sectors * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 
 	// Special case: truncating to zero keeps just the 8-byte header
 	if (logical_size == 0) {
