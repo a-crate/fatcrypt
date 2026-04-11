@@ -8,15 +8,21 @@
 
 #define FATCRYPT_MAGIC "FATCRYPT"
 #define FATCRYPT_VERSION 0x01
-#define FATCRYPT_MASTER_KEY_SIZE 32  // 256 bits
+
+// file encryption
 #define FATCRYPT_NONCE_SIZE 12       // 96 bits for GCM
 #define FATCRYPT_TAG_SIZE 16         // 128 bits for GCM
 #define FATCRYPT_UUID_SIZE 16        // 128 bits
 #define FATCRYPT_SALT_SIZE 16        // 128 bits for Argon2
+
+// key derivation for master key password
 #define FATCRYPT_HASH_ALG WC_SHA256
 #define FATCRYPT_3DS_ITERATIONS 1500
 #define FATCRYPT_ITERATIONS 100000
-#define FATCRYPT_KEY_NONCE_SIZE 24
+
+#define CHACHA20_POLY1305_AEAD_NONCE_SIZE 12
+#define CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE 16
+#define CHACHA20_POLY1305_AEAD_KEYSIZE 32
 
 // Master key blob magic
 #define FATCRYPT_MASTER_MAGIC "FCMASTER"

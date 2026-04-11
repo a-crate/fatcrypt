@@ -37,6 +37,9 @@ set(WOLFSSL_SOURCES
 	${WOLFSSL_DIR}/wolfcrypt/src/memory.c
 	${WOLFSSL_DIR}/wolfcrypt/src/error.c
 	${WOLFSSL_DIR}/wolfcrypt/src/logging.c
+	${WOLFSSL_DIR}/wolfcrypt/src/chacha20_poly1305.c
+	${WOLFSSL_DIR}/wolfcrypt/src/poly1305.c
+	${WOLFSSL_DIR}/wolfcrypt/src/chacha.c
 )
 
 set(CMAKE_REQUIRED_DEFINITIONS -D_FILE_OFFSET_BITS=64)

@@ -10,6 +10,8 @@
 #define HAVE_AES_DECRYPT
 #define WOLFSSL_SHA256
 #define HAVE_ARGON2
+#define HAVE_CHACHA
+#define HAVE_POLY1305
 
 /* Features we don't need - disable to reduce code size */
 #define NO_DSA

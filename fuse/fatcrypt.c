@@ -10,13 +10,13 @@
 #include <termios.h>
 #include <json-c/json.h>
 #include <fnmatch.h>
-#include <sodium.h>
 #include <wolfssl/wolfcrypt/pwdbased.h>
 #include <wolfssl/wolfcrypt/hmac.h>
 #include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/blake2-impl.h>
+#include <wolfssl/wolfcrypt/chacha20_poly1305.h>
 
 // Normalize a path by resolving . and .. components
 // Returns 0 on success, -1 on error (path traversal above root)
@@ -298,6 +298,44 @@ static int write_json_file(const char *path, const char *content) {
 	return 0;
 }
 
+// wrapper for ChaCha20-Poly1305
+// Output format: nonce (12 bytes) || mac (16 bytes) || ciphertext
+int secretbox_easy(
+    byte *out,
+    const byte *plaintext, word32 plaintext_len,
+    const byte *key
+) {
+    byte *nonce      = out;
+    byte *mac        = out + CHACHA20_POLY1305_AEAD_NONCE_SIZE;
+    byte *ciphertext = out + CHACHA20_POLY1305_AEAD_NONCE_SIZE + CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE;
+
+    if (fatcrypt_read_random_bytes(nonce, CHACHA20_POLY1305_AEAD_NONCE_SIZE) != 0) {
+	    return -1;
+    }
+
+    return wc_ChaCha20Poly1305_Encrypt(key, nonce, NULL, 0,
+                                       plaintext, plaintext_len,
+                                       ciphertext, mac);
+}
+
+int secretbox_open_easy(
+    byte *out,
+    const byte *ciphertext, word32 ciphertext_len,
+    const byte *key
+) {
+    const word32 overhead = CHACHA20_POLY1305_AEAD_NONCE_SIZE + CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE;
+    if (ciphertext_len < overhead) return -1;
+
+    const byte *nonce      = ciphertext;
+    const byte *mac        = ciphertext + CHACHA20_POLY1305_AEAD_NONCE_SIZE;
+    const byte *ctext      = ciphertext + overhead;
+    word32      ctext_len  = ciphertext_len - overhead;
+
+    return wc_ChaCha20Poly1305_Decrypt(key, nonce, NULL, 0,
+                                       ctext, ctext_len,
+                                       mac, out);
+}
+
 static int store_master_key(const char *path, const uint8_t *key, size_t key_size,
                             const char *passphrase, unsigned long long iterations) {
 	FILE *f = fopen(path, "wb");
@@ -325,13 +363,15 @@ static int store_master_key(const char *path, const uint8_t *key, size_t key_siz
 
 	if (encrypted) {
 		uint8_t salt[FATCRYPT_SALT_SIZE];
-		uint8_t derived_key[FATCRYPT_MASTER_KEY_SIZE];
+		uint8_t derived_key[CHACHA20_POLY1305_AEAD_KEYSIZE];
 
 		// Generate random salt
-		fatcrypt_read_random_bytes(salt, sizeof(salt));
+		if (fatcrypt_read_random_bytes(salt, sizeof(salt)) != 0){
+			return -1;
+		}
 
 		if (wc_PBKDF2(derived_key, (const unsigned char *)passphrase, strlen(passphrase),
-		                  salt, sizeof(salt), iterations, FATCRYPT_MASTER_KEY_SIZE, FATCRYPT_HASH_ALG) != 0) {
+		                  salt, sizeof(salt), iterations, CHACHA20_POLY1305_AEAD_KEYSIZE, FATCRYPT_HASH_ALG) != 0) {
 			fprintf(stderr, "PBKDF2 key derivation failed\n");
 			fclose(f);
 			unlink(path);
@@ -343,12 +383,15 @@ static int store_master_key(const char *path, const uint8_t *key, size_t key_siz
 			goto write_err;
 		}
 
-		// Encrypt master key with derived key using crypto_secretbox (XSalsa20-Poly1305)
-		uint8_t nonce[FATCRYPT_KEY_NONCE_SIZE];
-		fatcrypt_read_random_bytes(nonce, sizeof(nonce));
+		// Write encrypted key size (original size, big-endian)
+		uint8_t size_bytes[2] = {(key_size >> 8) & 0xFF, key_size & 0xFF};
+		if (fwrite(size_bytes, 1, 2, f) != 2) {
+			goto write_err;
+		}
 
-		uint8_t ciphertext[crypto_secretbox_MACBYTES + key_size];
-		if (crypto_secretbox_easy(ciphertext, key, key_size, nonce, derived_key) != 0) {
+		// Encrypt key (output includes nonce + mac + ciphertext)
+		uint8_t ciphertext[CHACHA20_POLY1305_AEAD_NONCE_SIZE + CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE + key_size];
+		if (secretbox_easy(ciphertext, key, key_size, derived_key) != 0) {
 			fprintf(stderr, "Encryption failed\n");
 			secure_zero_memory(derived_key, sizeof(derived_key));
 			fclose(f);
@@ -358,18 +401,7 @@ static int store_master_key(const char *path, const uint8_t *key, size_t key_siz
 
 		secure_zero_memory(derived_key, sizeof(derived_key));
 
-		// Write nonce
-		if (fwrite(nonce, 1, sizeof(nonce), f) != sizeof(nonce)) {
-			goto write_err;
-		}
-
-		// Write encrypted key size (original size, big-endian)
-		uint8_t size_bytes[2] = {(key_size >> 8) & 0xFF, key_size & 0xFF};
-		if (fwrite(size_bytes, 1, 2, f) != 2) {
-			goto write_err;
-		}
-
-		// Write ciphertext (includes MAC)
+		// Write ciphertext (includes nonce + MAC + encrypted key)
 		if (fwrite(ciphertext, 1, sizeof(ciphertext), f) != sizeof(ciphertext)) {
 			goto write_err;
 		}
@@ -522,7 +554,7 @@ void fatcrypt_free_config(fatcrypt_config_t *config) {
 
 // Sign config.json with master key
 int fatcrypt_sign_config(const char *mountpoint_dir, const uint8_t *master_key, size_t key_size) {
-	if (key_size != FATCRYPT_MASTER_KEY_SIZE) {
+	if (key_size != CHACHA20_POLY1305_AEAD_KEYSIZE) {
 		fprintf(stderr, "Invalid key size for signing\n");
 		return -1;
 	}
@@ -603,7 +635,7 @@ int fatcrypt_sign_config(const char *mountpoint_dir, const uint8_t *master_key, 
 
 // Verify config.json signature
 int fatcrypt_verify_config(const char *mountpoint_dir, const uint8_t *master_key, size_t key_size) {
-	if (key_size != FATCRYPT_MASTER_KEY_SIZE) {
+	if (key_size != CHACHA20_POLY1305_AEAD_KEYSIZE) {
 		fprintf(stderr, "Invalid key size for verification\n");
 		return -1;
 	}
@@ -686,8 +718,8 @@ int fatcrypt_verify_config(const char *mountpoint_dir, const uint8_t *master_key
 int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase,
                         fatcrypt_config_t *config,
                         uint8_t *key_out, size_t key_size) {
-	if (key_size != FATCRYPT_MASTER_KEY_SIZE) {
-		fprintf(stderr, "Invalid key size: %zu (expected %d)\n", key_size, FATCRYPT_MASTER_KEY_SIZE);
+	if (key_size != CHACHA20_POLY1305_AEAD_KEYSIZE) {
+		fprintf(stderr, "Invalid key size: %zu (expected %d)\n", key_size, CHACHA20_POLY1305_AEAD_KEYSIZE);
 		return -1;
 	}
 
@@ -762,14 +794,6 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 		return -1;
 	}
 
-	// Read nonce
-	uint8_t nonce[FATCRYPT_KEY_NONCE_SIZE];
-	if (fread(nonce, 1, sizeof(nonce), f) != sizeof(nonce)) {
-		fprintf(stderr, "Failed to read nonce\n");
-		fclose(f);
-		return -1;
-	}
-
 	// Read size
 	uint8_t size_bytes[2];
 	if (fread(size_bytes, 1, 2, f) != 2) {
@@ -785,8 +809,8 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 		return -1;
 	}
 
-	// Read ciphertext
-	uint8_t ciphertext[crypto_secretbox_MACBYTES + FATCRYPT_MASTER_KEY_SIZE];
+	// Read ciphertext (includes nonce + mac + encrypted key)
+	uint8_t ciphertext[CHACHA20_POLY1305_AEAD_NONCE_SIZE + CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE + CHACHA20_POLY1305_AEAD_KEYSIZE];
 	if (fread(ciphertext, 1, sizeof(ciphertext), f) != sizeof(ciphertext)) {
 		fprintf(stderr, "Failed to read ciphertext\n");
 		fclose(f);
@@ -795,16 +819,15 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 	fclose(f);
 
 	// Derive key from passphrase using config parameters
-	uint8_t derived_key[crypto_secretbox_KEYBYTES];
+	uint8_t derived_key[CHACHA20_POLY1305_AEAD_KEYSIZE];
 	if (wc_PBKDF2(derived_key, (const unsigned char *)passphrase, strlen(passphrase),
-	                  salt, sizeof(salt), config->kdf.iterations, FATCRYPT_MASTER_KEY_SIZE, FATCRYPT_HASH_ALG) != 0 ) {
+	                  salt, sizeof(salt), config->kdf.iterations, CHACHA20_POLY1305_AEAD_KEYSIZE, FATCRYPT_HASH_ALG) != 0 ) {
 		fprintf(stderr, "Key derivation failed\n");
 		return -1;
 	}
 
 	// Decrypt master key
-	if (crypto_secretbox_open_easy(key_out, ciphertext, sizeof(ciphertext),
-	                                nonce, derived_key) != 0) {
+	if (secretbox_open_easy(key_out, ciphertext, sizeof(ciphertext), derived_key) != 0) {
 		fprintf(stderr, "Decryption failed (wrong passphrase or corrupted data)\n");
 		secure_zero_memory(derived_key, sizeof(derived_key));
 		return -1;
@@ -871,9 +894,9 @@ int fatcrypt_derive_file_key(const uint8_t *master_key, size_t master_key_size,
 		return -1;
 	}
 
-	if (master_key_size != FATCRYPT_MASTER_KEY_SIZE) {
+	if (master_key_size != CHACHA20_POLY1305_AEAD_KEYSIZE) {
 		fprintf(stderr, "Invalid master key size: %zu (expected %d)\n",
-		        master_key_size, FATCRYPT_MASTER_KEY_SIZE);
+		        master_key_size, CHACHA20_POLY1305_AEAD_KEYSIZE);
 		return -1;
 	}
 
@@ -1183,7 +1206,7 @@ int fatcrypt_decrypt_block(const uint8_t *ciphertext, size_t ciphertext_len,
 int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 	char path_buf[1024];
 	char master_key_path[1024];
-	uint8_t master_key[FATCRYPT_MASTER_KEY_SIZE];
+	uint8_t master_key[CHACHA20_POLY1305_AEAD_KEYSIZE];
 	char passphrase_buf[256] = {0};
 	const char *passphrase = config->passphrase;
 
@@ -1213,7 +1236,7 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 
 	// Generate master key
 	printf("Generating master key...\n");
-	if (fatcrypt_generate_master_key(master_key, FATCRYPT_MASTER_KEY_SIZE) != 0) {
+	if (fatcrypt_generate_master_key(master_key, CHACHA20_POLY1305_AEAD_KEYSIZE) != 0) {
 		return -1;
 	}
 
@@ -1287,13 +1310,13 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 	// Store master key at .fat_crypt/keys/master.blob
 	snprintf(master_key_path, sizeof(master_key_path), "%s/.fat_crypt/keys/master.blob", config->mountpoint_dir);
 	printf("Storing master key to %s...\n", master_key_path);
-	if (store_master_key(master_key_path, master_key, FATCRYPT_MASTER_KEY_SIZE, passphrase, iterations) != 0) {
+	if (store_master_key(master_key_path, master_key, CHACHA20_POLY1305_AEAD_KEYSIZE, passphrase, iterations) != 0) {
 		goto cleanup;
 	}
 
 	// Sign config.json with master key
 	printf("Signing config.json...\n");
-	if (fatcrypt_sign_config(config->mountpoint_dir, master_key, FATCRYPT_MASTER_KEY_SIZE) != 0) {
+	if (fatcrypt_sign_config(config->mountpoint_dir, master_key, CHACHA20_POLY1305_AEAD_KEYSIZE) != 0) {
 		fprintf(stderr, "Failed to sign config.json\n");
 		goto cleanup;
 	}
