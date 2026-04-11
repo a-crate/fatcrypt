@@ -5534,28 +5534,6 @@ FRESULT f_unlink (
 				}
 			}
 			if (res == FR_OK) {
-				// Before deleting, check if this is an encrypted file and extract UUID for metadata cleanup
-				BYTE file_uuid[16];
-				int has_uuid = 0;
-				if (!(dj.obj.attr & AM_DIR) && fs->master_key_loaded) {
-					// Try to read file header to get UUID
-					FIL fp;
-					memset(&fp, 0, sizeof(fp));
-					if (f_open(&fp, path, FA_READ) == FR_OK) {
-						BYTE header_peek[512];
-						UINT br;
-						if (f_read(&fp, header_peek, sizeof(header_peek), &br) == FR_OK) {
-							if (fatcrypt_verify_header(header_peek, br) == 0) {
-								size_t header_size;
-								if (fatcrypt_read_header(header_peek, br, file_uuid, NULL, &header_size) == 0) {
-									has_uuid = 1;
-								}
-							}
-						}
-						f_close(&fp);
-					}
-				}
-
 				res = dir_remove(&dj);			/* Remove the directory entry */
 				if (res == FR_OK && dclst != 0) {	/* Remove the cluster chain if exist */
 #if FF_FS_EXFAT
@@ -5565,24 +5543,6 @@ FRESULT f_unlink (
 #endif
 				}
 				if (res == FR_OK) res = sync_fs(fs);
-
-				// Clean up metadata file if this was an encrypted file
-				if (res == FR_OK && has_uuid) {
-					// Convert UUID to hex string
-					char uuid_hex[33];
-					for (int i = 0; i < 16; i++) {
-						snprintf(uuid_hex + (i * 2), 3, "%02x", file_uuid[i]);
-					}
-					uuid_hex[32] = '\0';
-
-					// Build metadata path
-					char meta_path[2048];
-					snprintf(meta_path, sizeof(meta_path), "%s/.fat_crypt/meta/%s.json",
-					         fs->mountpoint_dir, uuid_hex);
-
-					// Delete metadata file (ignore errors - file might not exist)
-					remove(meta_path);
-				}
 			}
 		}
 		FREE_NAMBUF();

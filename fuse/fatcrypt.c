@@ -193,24 +193,6 @@ int fatcrypt_read_random_bytes(uint8_t *key_out, size_t key_size) {
 	return 0;
 }
 
-// Generate a random master key using /dev/urandom
-int fatcrypt_generate_master_key(uint8_t *key_out, size_t key_size) {
-	return fatcrypt_read_random_bytes(key_out, key_size);
-}
-
-// Generate a random UUID (version 4)
-int fatcrypt_generate_uuid(uint8_t *uuid_out) {
-	if (fatcrypt_read_random_bytes(uuid_out, FATCRYPT_UUID_SIZE) != 0) {
-		return -1;
-	}
-
-	// Set version 4 (random) and variant bits
-	uuid_out[6] = (uuid_out[6] & 0x0F) | 0x40;  // Version 4
-	uuid_out[8] = (uuid_out[8] & 0x3F) | 0x80;  // Variant 10
-
-	return 0;
-}
-
 // Read passphrase from terminal without echoing
 static int read_passphrase(char *buf, size_t bufsize, const char *prompt) {
 	struct termios old_term, new_term;
@@ -883,79 +865,6 @@ int fatcrypt_is_plaintext_path(const char *path, const fatcrypt_plaintext_t *pla
 	return 0;
 }
 
-// Derive per-file encryption key using HKDF-SHA256
-// K_file = HKDF-SHA256(MK, info = "fatcrypt-file:" + UUID)
-// Uses wolfSSL's wc_HKDF_Extract and wc_HKDF_Expand
-int fatcrypt_derive_file_key(const uint8_t *master_key, size_t master_key_size,
-                              const uint8_t *file_uuid, size_t uuid_size,
-                              uint8_t *file_key_out, size_t file_key_size) {
-	if (!master_key || !file_uuid || !file_key_out) {
-		fprintf(stderr, "Invalid parameters for file key derivation\n");
-		return -1;
-	}
-
-	if (master_key_size != CHACHA20_POLY1305_AEAD_KEYSIZE) {
-		fprintf(stderr, "Invalid master key size: %zu (expected %d)\n",
-		        master_key_size, CHACHA20_POLY1305_AEAD_KEYSIZE);
-		return -1;
-	}
-
-	if (uuid_size != FATCRYPT_UUID_SIZE) {
-		fprintf(stderr, "Invalid UUID size: %zu (expected %d)\n",
-		        uuid_size, FATCRYPT_UUID_SIZE);
-		return -1;
-	}
-
-	if (file_key_size != 32) {
-		fprintf(stderr, "Invalid file key size: %zu (expected 32)\n", file_key_size);
-		return -1;
-	}
-
-	// Build info string: "fatcrypt-file:" + UUID
-	const char *prefix = "fatcrypt-file:";
-	size_t prefix_len = strlen(prefix);
-	size_t info_len = prefix_len + uuid_size;
-	uint8_t *info = malloc(info_len);
-	if (!info) {
-		fprintf(stderr, "Failed to allocate memory for info string\n");
-		return -1;
-	}
-
-	memcpy(info, prefix, prefix_len);
-	memcpy(info + prefix_len, file_uuid, uuid_size);
-
-	// HKDF-Extract: PRK = HMAC-SHA256(salt, IKM)
-	// For our use case: salt = NULL (use zeros), IKM = master_key
-	uint8_t prk[WC_SHA256_DIGEST_SIZE];
-	int ret = wc_HKDF_Extract(WC_HASH_TYPE_SHA256,
-	                          NULL, 0,                    // No salt
-	                          (byte*)master_key, master_key_size,  // IKM = master key
-	                          prk);
-	if (ret != 0) {
-		fprintf(stderr, "HKDF-Extract failed: %d\n", ret);
-		free(info);
-		return -1;
-	}
-
-	// HKDF-Expand: OKM = HMAC-SHA256(PRK, info || counter)
-	ret = wc_HKDF_Expand(WC_HASH_TYPE_SHA256,
-	                     prk, sizeof(prk),                // PRK from extract
-	                     info, info_len,                  // Info = "fatcrypt-file:" || UUID
-	                     file_key_out, file_key_size);    // Output key
-	if (ret != 0) {
-		fprintf(stderr, "HKDF-Expand failed: %d\n", ret);
-		free(info);
-		memset(prk, 0, sizeof(prk));  // Clear sensitive data
-		return -1;
-	}
-
-	// Clean up
-	free(info);
-	memset(prk, 0, sizeof(prk));  // Clear sensitive data
-
-	return 0;
-}
-
 // Derive per-file nonce from starting cluster number
 // TODO: implement nonce file for proper per-file nonces
 // For now, use a fixed nonce (insecure but allows testing)
@@ -964,135 +873,7 @@ void fatcrypt_derive_file_nonce(uint32_t sclust, uint8_t *nonce_out) {
 	memset(nonce_out, 0, 12);
 }
 
-// Write encrypted file header to buffer
-// Returns the total header size, or -1 on error
-int fatcrypt_write_header(uint8_t *buffer, size_t buffer_size,
-                           const uint8_t *file_uuid, const uint8_t *nonce,
-                           const uint8_t *aad, size_t aad_len) {
-	if (!buffer || !file_uuid || !nonce) {
-		fprintf(stderr, "Invalid parameters for write_header\n");
-		return -1;
-	}
-
-	// Calculate total header size
-	size_t header_size = 8 + 1 + 16 + 12 + 2 + aad_len;
-	if (buffer_size < header_size) {
-		fprintf(stderr, "Buffer too small for header: %zu < %zu\n", buffer_size, header_size);
-		return -1;
-	}
-
-	if (aad_len > 65535) {
-		fprintf(stderr, "AAD too large: %zu\n", aad_len);
-		return -1;
-	}
-
-	size_t offset = 0;
-
-	// Write magic
-	memcpy(buffer + offset, FATCRYPT_MAGIC, 8);
-	offset += 8;
-
-	// Write version
-	buffer[offset++] = FATCRYPT_VERSION;
-
-	// Write UUID
-	memcpy(buffer + offset, file_uuid, FATCRYPT_UUID_SIZE);
-	offset += FATCRYPT_UUID_SIZE;
-
-	// Write nonce
-	memcpy(buffer + offset, nonce, FATCRYPT_NONCE_SIZE);
-	offset += FATCRYPT_NONCE_SIZE;
-
-	// Write AAD length (big-endian)
-	buffer[offset++] = (aad_len >> 8) & 0xFF;
-	buffer[offset++] = aad_len & 0xFF;
-
-	// Write AAD if present
-	if (aad && aad_len > 0) {
-		memcpy(buffer + offset, aad, aad_len);
-		offset += aad_len;
-	}
-
-	return (int)header_size;
-}
-
-// Read and parse encrypted file header from buffer
-// Returns header size on success, -1 on error
-int fatcrypt_read_header(const uint8_t *buffer, size_t buffer_size,
-                          uint8_t *file_uuid_out, uint8_t *nonce_out,
-                          size_t *header_size_out) {
-	if (!buffer || !file_uuid_out || !nonce_out || !header_size_out) {
-		fprintf(stderr, "Invalid parameters for read_header\n");
-		return -1;
-	}
-
-	// Minimum header size without AAD
-	size_t min_size = 8 + 1 + 16 + 12 + 2;
-	if (buffer_size < min_size) {
-		fprintf(stderr, "Buffer too small for header: %zu < %zu\n", buffer_size, min_size);
-		return -1;
-	}
-
-	size_t offset = 0;
-
-	// Verify magic
-	if (memcmp(buffer + offset, FATCRYPT_MAGIC, 8) != 0) {
-		fprintf(stderr, "Invalid magic bytes in file header\n");
-		return -1;
-	}
-	offset += 8;
-
-	// Verify version
-	if (buffer[offset] != FATCRYPT_VERSION) {
-		fprintf(stderr, "Unsupported version: 0x%02x\n", buffer[offset]);
-		return -1;
-	}
-	offset++;
-
-	// Read UUID
-	memcpy(file_uuid_out, buffer + offset, FATCRYPT_UUID_SIZE);
-	offset += FATCRYPT_UUID_SIZE;
-
-	// Read nonce
-	memcpy(nonce_out, buffer + offset, FATCRYPT_NONCE_SIZE);
-	offset += FATCRYPT_NONCE_SIZE;
-
-	// Read AAD length
-	uint16_t aad_len = ((uint16_t)buffer[offset] << 8) | buffer[offset + 1];
-	offset += 2;
-
-	// Calculate total header size
-	size_t header_size = min_size + aad_len;
-	if (buffer_size < header_size) {
-		fprintf(stderr, "Buffer too small for AAD: %zu < %zu\n", buffer_size, header_size);
-		return -1;
-	}
-
-	*header_size_out = header_size;
-	return 0;
-}
-
-// Verify file header magic and version
-// Returns 0 if valid, -1 if invalid
-int fatcrypt_verify_header(const uint8_t *buffer, size_t buffer_size) {
-	if (!buffer || buffer_size < 9) {
-		return -1;
-	}
-
-	// Check magic
-	if (memcmp(buffer, FATCRYPT_MAGIC, 8) != 0) {
-		return -1;
-	}
-
-	// Check version
-	if (buffer[8] != FATCRYPT_VERSION) {
-		return -1;
-	}
-
-	return 0;
-}
-
-// Encrypt a block of data using AES-256-GCM
+// Encrypt a block of data using XChaCha20-Poly1305
 // ciphertext_out must have space for plaintext_len bytes
 // tag_out must have space for FATCRYPT_TAG_SIZE (16) bytes
 int fatcrypt_encrypt_block(const uint8_t *plaintext, size_t plaintext_len,
@@ -1147,7 +928,7 @@ int fatcrypt_encrypt_block(const uint8_t *plaintext, size_t plaintext_len,
 	return 0;
 }
 
-// Decrypt a block of data using AES-256-GCM
+// Decrypt a block of data using XChaCha20-Poly1305
 // plaintext_out must have space for ciphertext_len bytes
 // Returns 0 on success, -1 on failure (including auth tag mismatch)
 int fatcrypt_decrypt_block(const uint8_t *ciphertext, size_t ciphertext_len,
@@ -1236,7 +1017,7 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 
 	// Generate master key
 	printf("Generating master key...\n");
-	if (fatcrypt_generate_master_key(master_key, CHACHA20_POLY1305_AEAD_KEYSIZE) != 0) {
+	if (fatcrypt_read_random_bytes(master_key, CHACHA20_POLY1305_AEAD_KEYSIZE) != 0) {
 		return -1;
 	}
 
