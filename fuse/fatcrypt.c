@@ -787,13 +787,9 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 
 	// Derive key from passphrase using config parameters
 	uint8_t derived_key[crypto_secretbox_KEYBYTES];
-	if (crypto_pwhash(derived_key, sizeof(derived_key),
-	                  passphrase, strlen(passphrase),
-	                  salt,
-	                  config->kdf.iterations,
-	                  config->kdf.iterations,
-	                  config->kdf.iterations) != 0) {
-		fprintf(stderr, "Key derivation failed (out of memory)\n");
+	if (wc_PBKDF2(derived_key, (const unsigned char *)passphrase, strlen(passphrase),
+	                  salt, sizeof(salt), config->kdf.iterations, FATCRYPT_MASTER_KEY_SIZE, FATCRYPT_HASH_ALG) != 0 ) {
+		fprintf(stderr, "Key derivation failed\n");
 		return -1;
 	}
 
