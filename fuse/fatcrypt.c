@@ -570,8 +570,11 @@ int fatcrypt_sign_config(const char *mountpoint_dir, const uint8_t *master_key, 
 	free(config_data);
 
 	// Compute HMAC of the hash using master key
-	uint8_t signature[crypto_auth_BYTES];
-	crypto_auth(signature, hash, sizeof(hash), master_key);
+	Hmac hmac;
+	byte mac[WC_SHA256_DIGEST_SIZE];
+	wc_HmacSetKey(&hmac, WC_SHA256, master_key, sizeof(master_key));
+	wc_HmacUpdate(&hmac, hash, sizeof(hash));
+	wc_HmacFinal(&hmac, mac);
 
 	// Write signature to config.sig
 	char sig_path[1024];
@@ -583,7 +586,7 @@ int fatcrypt_sign_config(const char *mountpoint_dir, const uint8_t *master_key, 
 		return -1;
 	}
 
-	if (fwrite(signature, 1, sizeof(signature), sig_file) != sizeof(signature)) {
+	if (fwrite(mac, 1, sizeof(mac), sig_file) != sizeof(mac)) {
 		fprintf(stderr, "Failed to write signature\n");
 		fclose(sig_file);
 		unlink(sig_path);
@@ -657,7 +660,7 @@ int fatcrypt_verify_config(const char *mountpoint_dir, const uint8_t *master_key
 		return -1;
 	}
 
-	uint8_t signature[crypto_auth_BYTES];
+	uint8_t signature[WC_SHA256_DIGEST_SIZE];
 	if (fread(signature, 1, sizeof(signature), sig_file) != sizeof(signature)) {
 		fprintf(stderr, "Failed to read signature\n");
 		fclose(sig_file);
@@ -666,7 +669,13 @@ int fatcrypt_verify_config(const char *mountpoint_dir, const uint8_t *master_key
 	fclose(sig_file);
 
 	// Verify HMAC
-	if (crypto_auth_verify(signature, hash, sizeof(hash), master_key) != 0) {
+	Hmac hmac;
+	byte expected[WC_SHA256_DIGEST_SIZE];
+	wc_HmacSetKey(&hmac, WC_SHA256, master_key, sizeof(master_key));
+	wc_HmacUpdate(&hmac, hash, sizeof(hash));
+	wc_HmacFinal(&hmac, expected);
+
+	if (memcmp(hash, expected, WC_SHA256_DIGEST_SIZE) != 0) {
 		fprintf(stderr, "Config signature verification failed - config may have been tampered with\n");
 		return -1;
 	}
