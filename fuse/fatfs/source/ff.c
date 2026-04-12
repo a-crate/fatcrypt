@@ -3645,6 +3645,22 @@ static FRESULT validate (	/* Returns FR_OK or FR_INVALID_OBJECT */
 /* Internal crypto functions */
 /*--------------------------*/
 
+/*------------------------*/
+/* Initialize header with */
+/* defaults               */
+/*------------------------*/
+void init_fatcrypt_header(
+	FIL *fp, // file this header is for
+	fatcrypt_header_t *out // header to initialize
+)
+{
+	memcpy(out->magic, FATCRYPT_MAGIC, FATCRYPT_MAGIC_SIZE);
+	out->version = FATCRYPT_VERSION;
+	out->logical_size = 0;
+	// Derive base nonce from starting cluster
+	fatcrypt_derive_file_nonce(fp->obj.sclust, out->base_nonce);
+}
+
 /*-------------------*/
 /* Parse file header */
 /*-------------------*/
@@ -3657,16 +3673,20 @@ FRESULT parse_fatcrypt_header(
 	UINT header_read;
 	FSIZE_t old_pos = fp->fptr;
 
-	if (fp->obj.objsize == 0) {
+	if (fp->obj.sclust < 2) { // sclust 0 and 1 are reserved / invalid
+		// no clusters allocated, file is physically empty
 		return FR_NO_HEADER;
 	}
 	res = f_lseek(fp, 0);
 	if (res != FR_OK) goto err;
 
 	res = f_read(fp, out->magic, FATCRYPT_MAGIC_SIZE, &header_read);
-	if (res != FR_OK) goto err;
+	if (res != FR_OK || header_read == 0) {
+		res = FR_NO_HEADER;
+		goto err;
+	}
 	if (header_read < FATCRYPT_MAGIC_SIZE) {
-		res = FR_INT_ERR;
+		res = FR_BAD_HEADER;
 		goto err;
 	}
 	if (memcmp(FATCRYPT_MAGIC, out->magic, FATCRYPT_MAGIC_SIZE) != 0) {
@@ -3704,7 +3724,8 @@ FRESULT parse_fatcrypt_header(
 		goto err;
 	}
 
-	return f_lseek(fp, old_pos);
+	f_lseek(fp, old_pos);
+	res = FR_OK;
 	err:
 	f_lseek(fp, old_pos);
 	return res;
@@ -3740,7 +3761,8 @@ FRESULT update_fatcrypt_header(
 		goto err;
 	}
 
-	return f_lseek(fp, old_pos);
+	f_lseek(fp, old_pos);
+	res = FR_OK;
 	err:
 	f_lseek(fp, old_pos);
 	return res;
@@ -4025,6 +4047,7 @@ FRESULT f_crypt_read (
 {
 	FATFS *fs;
 	FRESULT res;
+	fatcrypt_header_t f_header;
 
 	*br = 0;
 	res = validate(&fp->obj, &fs);
@@ -4042,32 +4065,16 @@ FRESULT f_crypt_read (
 
 	UINT sector_size = SS(fs);
 
-	// Read logical file size from 8-byte header at start of file
-	BYTE size_header[8];
-	res = f_lseek(fp, 0);
-	if (res != FR_OK) return res;
-
-	UINT header_read;
-	res = f_read(fp, size_header, 8, &header_read);
-	if (res != FR_OK) return res;
-	if (header_read < 8) {
-		// File too short or empty, no data to read
+	res = parse_fatcrypt_header(fp, &f_header);
+	if (res == FR_NO_HEADER) {
+		// file is physically zero bytes, no data to read
 		*br = 0;
 		return FR_OK;
 	}
-
-	// Parse logical size (little-endian)
-	FSIZE_t logical_file_size = ((FSIZE_t)size_header[0]) |
-	                            ((FSIZE_t)size_header[1] << 8) |
-	                            ((FSIZE_t)size_header[2] << 16) |
-	                            ((FSIZE_t)size_header[3] << 24) |
-	                            ((FSIZE_t)size_header[4] << 32) |
-	                            ((FSIZE_t)size_header[5] << 40) |
-	                            ((FSIZE_t)size_header[6] << 48) |
-	                            ((FSIZE_t)size_header[7] << 56);
+	if (res != FR_OK) return res;
 
 	// Limit read to not exceed logical file size
-	FSIZE_t available_bytes = logical_file_size - fp->crypt_logical_fptr;
+	FSIZE_t available_bytes = f_header.logical_size - fp->crypt_logical_fptr;
 	if (available_bytes <= 0) {
 		*br = 0;
 		return FR_OK;  // Already at or past EOF
@@ -4076,10 +4083,6 @@ FRESULT f_crypt_read (
 		remaining = (UINT)available_bytes;
 	}
 	btr = remaining;  // Update btr to reflect limited read
-
-	// Derive nonce from starting cluster
-	BYTE base_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
-	fatcrypt_derive_file_nonce(fp->obj.sclust, base_nonce);
 
 	// crypt_logical_fptr tracks logical position in decrypted data
 	// Calculate which sector and offset within sector
@@ -4092,8 +4095,8 @@ FRESULT f_crypt_read (
 		BYTE block_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
 
 		// Calculate physical position for this block
-		// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
-		FSIZE_t physical_pos = 8 + block_idx * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
+		// Physical layout: [header][sector0_cipher][tag0][sector1_cipher][tag1]...
+		FSIZE_t physical_pos = FATCRYPT_HEADER_SIZE + block_idx * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 
 		// Seek to physical position
 		res = f_lseek(fp, physical_pos);
@@ -4112,7 +4115,7 @@ FRESULT f_crypt_read (
 		}
 
 		// Generate per-block nonce
-		fatcrypt_derive_block_nonce(base_nonce, block_idx, block_nonce);
+		fatcrypt_derive_block_nonce(f_header.base_nonce, block_idx, block_nonce);
 
 		// Decrypt the block
 		if (fatcrypt_decrypt_block(ciphertext_buf, sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
@@ -4258,6 +4261,7 @@ FRESULT f_crypt_write (
 {
 	FATFS *fs;
 	FRESULT res;
+	fatcrypt_header_t fheader;
 
 	*bw = 0;
 	res = validate(&fp->obj, &fs);
@@ -4275,9 +4279,12 @@ FRESULT f_crypt_write (
 
 	UINT sector_size = SS(fs);
 
-	// Derive nonce from starting cluster
-	BYTE base_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
-	fatcrypt_derive_file_nonce(fp->obj.sclust, base_nonce);
+	res = parse_fatcrypt_header(fp, &fheader);
+	if (res == FR_NO_HEADER) {
+		init_fatcrypt_header(fp, &fheader);
+	} else if (res != FR_OK) {
+		return res;
+	}
 
 	// crypt_logical_fptr tracks logical position in decrypted data
 	// Calculate starting block index and offset
@@ -4297,17 +4304,16 @@ FRESULT f_crypt_write (
 		int partial_sector = (offset_in_sector != 0) || (chunk_size < sector_size);
 
 		// Calculate physical position for this block
-		// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
-		FSIZE_t sector_start = 8 + block_idx * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
+		// Physical layout: [header][sector0_cipher][tag0][sector1_cipher][tag1]...
+		FSIZE_t sector_start = FATCRYPT_HEADER_SIZE + block_idx * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 
+		// Need to read existing sector, modify it, and write back
+		// Seek to start of this sector
+		res = f_lseek(fp, sector_start);
+		if (res != FR_OK) {
+			return res;
+		}
 		if (partial_sector) {
-			// Need to read existing sector, modify it, and write back
-			// Seek to start of this sector
-			res = f_lseek(fp, sector_start);
-			if (res != FR_OK) {
-				return res;
-			}
-
 			// Read existing encrypted sector + tag
 			UINT read_count;
 			res = f_read(fp, ciphertext_buf, sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE, &read_count);
@@ -4316,7 +4322,7 @@ FRESULT f_crypt_write (
 				memset(plaintext_buf, 0, sector_size);
 			} else if (read_count == sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE) {
 				// Decrypt existing sector
-				fatcrypt_derive_block_nonce(base_nonce, block_idx, block_nonce);
+				fatcrypt_derive_block_nonce(fheader.base_nonce, block_idx, block_nonce);
 
 				if (fatcrypt_decrypt_block(ciphertext_buf, sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
 				                            fs->master_key, sizeof(fs->master_key),
@@ -4332,8 +4338,11 @@ FRESULT f_crypt_write (
 			// Modify the plaintext buffer
 			memcpy(plaintext_buf + offset_in_sector, input, chunk_size);
 
-			// Seek back to write position
+			// Seek back to write position, write as full sector with modified plaintext
 			f_lseek(fp, sector_start);
+			if (res != FR_OK) {
+				return res;
+			}
 		} else {
 			// Full sector write, just use input data
 			memcpy(plaintext_buf, input, chunk_size);
@@ -4344,7 +4353,7 @@ FRESULT f_crypt_write (
 		}
 
 		// Generate per-block nonce
-		fatcrypt_derive_block_nonce(base_nonce, block_idx, block_nonce);
+		fatcrypt_derive_block_nonce(fheader.base_nonce, block_idx, block_nonce);
 
 		// Encrypt the block
 		if (fatcrypt_encrypt_block(plaintext_buf, sector_size,
@@ -4374,49 +4383,10 @@ FRESULT f_crypt_write (
 		offset_in_sector = 0;
 	}
 
-	// Update logical file size header at offset 0
-	FSIZE_t new_logical_size = fp->crypt_logical_fptr;
-
-	// Read current logical size
-	BYTE size_header[8];
-	res = f_lseek(fp, 0);
-	if (res != FR_OK) return res;
-
-	UINT header_read;
-	res = f_read(fp, size_header, 8, &header_read);
-	FSIZE_t current_logical_size = 0;
-	if (res == FR_OK && header_read == 8) {
-		// Parse current logical size (little-endian)
-		current_logical_size = ((FSIZE_t)size_header[0]) |
-		                       ((FSIZE_t)size_header[1] << 8) |
-		                       ((FSIZE_t)size_header[2] << 16) |
-		                       ((FSIZE_t)size_header[3] << 24) |
-		                       ((FSIZE_t)size_header[4] << 32) |
-		                       ((FSIZE_t)size_header[5] << 40) |
-		                       ((FSIZE_t)size_header[6] << 48) |
-		                       ((FSIZE_t)size_header[7] << 56);
-	}
-
-	// Only update if we extended the file
-	if (new_logical_size > current_logical_size) {
-		// Write new logical size (little-endian)
-		size_header[0] = (BYTE)(new_logical_size & 0xFF);
-		size_header[1] = (BYTE)((new_logical_size >> 8) & 0xFF);
-		size_header[2] = (BYTE)((new_logical_size >> 16) & 0xFF);
-		size_header[3] = (BYTE)((new_logical_size >> 24) & 0xFF);
-		size_header[4] = (BYTE)((new_logical_size >> 32) & 0xFF);
-		size_header[5] = (BYTE)((new_logical_size >> 40) & 0xFF);
-		size_header[6] = (BYTE)((new_logical_size >> 48) & 0xFF);
-		size_header[7] = (BYTE)((new_logical_size >> 56) & 0xFF);
-
-		res = f_lseek(fp, 0);
-		if (res != FR_OK) return res;
-
-		UINT header_written;
-		res = f_write(fp, size_header, 8, &header_written);
-		if (res != FR_OK || header_written != 8) {
-			return res != FR_OK ? res : FR_INT_ERR;
-		}
+	// Only update header if we extended the file
+	if (fp->crypt_logical_fptr > fheader.logical_size) {
+		fheader.logical_size = fp->crypt_logical_fptr;
+		return update_fatcrypt_header(fp, &fheader);
 	}
 
 	return FR_OK;
@@ -5029,14 +4999,14 @@ FRESULT f_crypt_lseek (
 	sector_size = SS(fs);
 
 	// Calculate physical offset from logical offset
-	// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
+	// Physical layout: [header][sector0_cipher][tag0][sector1_cipher][tag1]...
 	// Each logical sector of data requires (sector_size + 16) bytes physically
 	//
 	// Note: We always seek to the start of the sector that contains the logical offset.
 	// The offset within the sector is handled by f_crypt_read/write.
 
 	FSIZE_t sector_idx = logical_ofs / sector_size;
-	physical_ofs = 8 + sector_idx * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
+	physical_ofs = FATCRYPT_HEADER_SIZE + sector_idx * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 
 	// Store logical position
 	fp->crypt_logical_fptr = logical_ofs;
@@ -5469,6 +5439,7 @@ FRESULT f_crypt_truncate (
 	FATFS *fs;
 	FSIZE_t physical_size;
 	UINT sector_size;
+	fatcrypt_header_t fheader;
 
 	res = validate(&fp->obj, &fs);
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) return res;
@@ -5483,14 +5454,14 @@ FRESULT f_crypt_truncate (
 	sector_size = SS(fs);
 
 	// Calculate physical size for the given logical size
-	// Physical layout: [header(8)][sector0_cipher][tag0][sector1_cipher][tag1]...
+	// Physical layout: [header][sector0_cipher][tag0][sector1_cipher][tag1]...
 	// Each sector requires sector_size + 16 bytes
 	FSIZE_t num_sectors = (logical_size + sector_size - 1) / sector_size;  // Round up
-	physical_size = 8 + num_sectors * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
+	physical_size = FATCRYPT_HEADER_SIZE + num_sectors * (sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 
-	// Special case: truncating to zero keeps just the 8-byte header
+	// Special case: truncating to zero keeps just the header
 	if (logical_size == 0) {
-		physical_size = 8;
+		physical_size = FATCRYPT_HEADER_SIZE;
 	}
 
 	// Seek to the physical position
@@ -5501,27 +5472,17 @@ FRESULT f_crypt_truncate (
 	res = f_truncate(fp);
 	if (res != FR_OK) return res;
 
-	// Update the logical size header
-	BYTE size_header[8];
-	size_header[0] = (BYTE)(logical_size & 0xFF);
-	size_header[1] = (BYTE)((logical_size >> 8) & 0xFF);
-	size_header[2] = (BYTE)((logical_size >> 16) & 0xFF);
-	size_header[3] = (BYTE)((logical_size >> 24) & 0xFF);
-	size_header[4] = (BYTE)((logical_size >> 32) & 0xFF);
-	size_header[5] = (BYTE)((logical_size >> 40) & 0xFF);
-	size_header[6] = (BYTE)((logical_size >> 48) & 0xFF);
-	size_header[7] = (BYTE)((logical_size >> 56) & 0xFF);
-
-	res = f_lseek(fp, 0);
-	if (res != FR_OK) return res;
-
-	UINT header_written;
-	res = f_write(fp, size_header, 8, &header_written);
-	if (res != FR_OK || header_written != 8) {
-		return res != FR_OK ? res : FR_INT_ERR;
+	res = parse_fatcrypt_header(fp, &fheader);
+	if (res == FR_NO_HEADER) {
+		init_fatcrypt_header(fp, &fheader);
+	} else if (res != FR_OK) {
+		return res;
 	}
 
-	return FR_OK;
+	fheader.logical_size = logical_size;
+
+	// Update size header
+	return update_fatcrypt_header(fp, &fheader);
 }
 
 

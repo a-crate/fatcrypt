@@ -1,7 +1,5 @@
 * Stop using fixed nonce
 
-* Stick fatcrypt version in file header
-
 * Derive per-file keys
 
 * Use AAD
