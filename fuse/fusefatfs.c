@@ -248,8 +248,10 @@ static int fff_write(const char *path, const char *buf, size_t size, off_t offse
 	UINT bw;
 
 	BYTE ffmode = flags2ffmode(fi->flags);
-	if (!ffentry->fs.master_key_loaded || fatcrypt_is_metadata_path(path) || fatcrypt_is_plaintext_path(path, &ffentry->config.plaintext)) {
-		ffmode |= FA_READ;  // Encrypted files need read for read-modify-write
+	if (ffentry->fs.master_key_loaded && !fatcrypt_is_metadata_path(path) && !fatcrypt_is_plaintext_path(path, &ffentry->config.plaintext)) {
+		ffmode |= FA_READ;  /* Encrypted files must have read for read-modify-write.
+		*  It's slightly awkward to force it here, but it's worse to do it inside fatfs
+		*  and potentially break locking semantics or something. */
 	}
 
 	if (ffentry->flags & FFFF_RDONLY)

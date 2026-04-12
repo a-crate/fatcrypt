@@ -4339,6 +4339,8 @@ FRESULT f_crypt_write (
 	if (res == FR_NO_HEADER) {
 		fatcrypt_debug("DEBUG f_crypt_write: calling init_fatcrypt_header\n");
 		init_fatcrypt_header(fp, &fheader);
+		res = update_fatcrypt_header(fp, &fheader);
+		if (res != FR_OK) return res;
 	} else if (res != FR_OK) {
 		fatcrypt_debug("DEBUG f_crypt_write: parse failed, returning %d\n", res);
 		return res;
@@ -4352,6 +4354,8 @@ FRESULT f_crypt_write (
 	fatcrypt_debug("DEBUG f_crypt_write: entering write loop, remaining=%u block_idx=%lu offset=%u\n",
 	        remaining, (unsigned long)block_idx, offset_in_sector);
 
+	// TODO: write in sector_size - AUTHTAG_SIZE chunks instead of sector_size, should be better performance
+	// and use of space
 	while (remaining > 0) {
 		fatcrypt_debug("DEBUG f_crypt_write: loop iteration, remaining=%u block_idx=%lu\n",
 		        remaining, (unsigned long)block_idx);
@@ -5291,6 +5295,7 @@ FRESULT f_crypt_stat (
 {
 	FRESULT res;
 	FIL fp;
+	fatcrypt_header_t fheader;
 
 	res = f_stat(path, fno);
 	if (res != FR_OK) {
@@ -5304,22 +5309,13 @@ FRESULT f_crypt_stat (
 			f_close(&fp);
 			return res;
 		}
-
-		if (fno->fsize >= 8) {
-			BYTE size_header[8];
-			UINT br;
-			res = f_read(&fp, size_header, 8, &br);
-			if (res == FR_OK && br == 8) {
-				FSIZE_t lsize = ((FSIZE_t)size_header[0]) |
-				((FSIZE_t)size_header[1] << 8) |
-				((FSIZE_t)size_header[2] << 16) |
-				((FSIZE_t)size_header[3] << 24) |
-				((FSIZE_t)size_header[4] << 32) |
-				((FSIZE_t)size_header[5] << 40) |
-				((FSIZE_t)size_header[6] << 48) |
-				((FSIZE_t)size_header[7] << 56);
-				fno->fsize = lsize;
+		if (fno->fsize >= FATCRYPT_HEADER_SIZE) {
+			res = parse_fatcrypt_header(&fp, &fheader);
+			if (res == FR_OK) {
+				fno->fsize = fheader.logical_size;
 			}
+			// Ignoring other errors is necessary here for
+			// reasons I don't totally understand. Causes problems.
 		}
 		f_close(&fp);
 	}
