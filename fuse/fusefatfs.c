@@ -246,9 +246,15 @@ static int fff_write(const char *path, const char *buf, size_t size, off_t offse
 	const char fffpath(ffentry->index, path);
 	FIL fp;
 	UINT bw;
+
+	BYTE ffmode = flags2ffmode(fi->flags);
+	if (!ffentry->fs.master_key_loaded || fatcrypt_is_metadata_path(path) || fatcrypt_is_plaintext_path(path, &ffentry->config.plaintext)) {
+		ffmode |= FA_READ;  // Encrypted files need read for read-modify-write
+	}
+
 	if (ffentry->flags & FFFF_RDONLY)
 		mutex_out_return(-EROFS);
-	FRESULT fres = f_open(&fp, fffpath, flags2ffmode(fi->flags));
+	FRESULT fres = f_open(&fp, fffpath, ffmode);
 	if (fres != FR_OK)
 		goto earlyerr;
 

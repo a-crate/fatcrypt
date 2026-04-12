@@ -5161,12 +5161,12 @@ FRESULT f_crypt_stat (
 			if (res == FR_OK && br == 8) {
 				FSIZE_t lsize = ((FSIZE_t)size_header[0]) |
 					((FSIZE_t)size_header[1] << 8) |
-					((FSIZE_t)size_header[1] << 16) |
-		  			((FSIZE_t)size_header[1] << 24) |
-		    		((FSIZE_t)size_header[1] << 32) |
-		    		((FSIZE_t)size_header[1] << 40) |
-		    		((FSIZE_t)size_header[1] << 48) |
-		    		((FSIZE_t)size_header[1] << 56);
+					((FSIZE_t)size_header[2] << 16) |
+		  			((FSIZE_t)size_header[3] << 24) |
+		    		((FSIZE_t)size_header[4] << 32) |
+		    		((FSIZE_t)size_header[5] << 40) |
+		    		((FSIZE_t)size_header[6] << 48) |
+		    		((FSIZE_t)size_header[7] << 56);
 				fno->fsize = lsize;
 			}
 		}
