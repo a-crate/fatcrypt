@@ -84,13 +84,13 @@ int fatcrypt_derive_file_key(const uint8_t *master_key, size_t master_key_size,
                               const uint8_t *file_uuid, size_t uuid_size,
                               uint8_t *file_key_out, size_t file_key_size);
 void fatcrypt_derive_file_nonce(uint32_t sclust, uint8_t *nonce_out);
+void fatcrypt_derive_block_nonce(const uint8_t *base_nonce, uint32_t block_idx, uint8_t *block_nonce_out);
 int fatcrypt_encrypt_block(const uint8_t *plaintext, size_t plaintext_len,
                             const uint8_t *key, size_t key_len,
                             const uint8_t *nonce, size_t nonce_len,
                             const uint8_t *aad, size_t aad_len,
-                            uint8_t *ciphertext_out, uint8_t *tag_out);
+                            uint8_t *ciphertext_out);
 int fatcrypt_decrypt_block(const uint8_t *ciphertext, size_t ciphertext_len,
-                            const uint8_t *tag,
                             const uint8_t *key, size_t key_len,
                             const uint8_t *nonce, size_t nonce_len,
                             const uint8_t *aad, size_t aad_len,

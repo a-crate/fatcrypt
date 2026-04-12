@@ -3985,9 +3985,8 @@ FRESULT f_crypt_read (
 	UINT offset_in_sector = (UINT)(fp->crypt_logical_fptr % sector_size);
 
 	while (remaining > 0) {
-		BYTE ciphertext_buf[FF_MAX_SS];
+		BYTE ciphertext_buf[FF_MAX_SS + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE];
 		BYTE plaintext_buf[FF_MAX_SS];
-		BYTE tag[XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE];
 		BYTE block_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
 
 		// Calculate physical position for this block
@@ -4000,34 +3999,21 @@ FRESULT f_crypt_read (
 			return res;
 		}
 
-		// Read ciphertext
+		// Read ciphertext + tag
 		UINT read_count;
-		res = f_read(fp, ciphertext_buf, sector_size, &read_count);
+		res = f_read(fp, ciphertext_buf, sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE, &read_count);
 		if (res != FR_OK) {
 			return res;
 		}
-		if (read_count != sector_size) {
+		if (read_count != sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE) {
 			return FR_INT_ERR;
 		}
 
-		// Read tag
-		res = f_read(fp, tag, XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE, &read_count);
-		if (res != FR_OK) {
-			return res;
-		}
-		if (read_count != XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE) {
- 			return FR_INT_ERR;
- 		}
-
-		// Generate per-block nonce: base_nonce XOR block_index
-		memcpy(block_nonce, base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
-		block_nonce[8] ^= (block_idx >> 24) & 0xFF;
-		block_nonce[9] ^= (block_idx >> 16) & 0xFF;
-		block_nonce[10] ^= (block_idx >> 8) & 0xFF;
-		block_nonce[11] ^= block_idx & 0xFF;
+		// Generate per-block nonce
+		fatcrypt_derive_block_nonce(base_nonce, block_idx, block_nonce);
 
 		// Decrypt the block
-		if (fatcrypt_decrypt_block(ciphertext_buf, sector_size, tag,
+		if (fatcrypt_decrypt_block(ciphertext_buf, sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
 		                            fs->master_key, sizeof(fs->master_key),
 		                            block_nonce, sizeof(block_nonce),
 		                            NULL, 0,
@@ -4198,8 +4184,7 @@ FRESULT f_crypt_write (
 
 	while (remaining > 0) {
 		BYTE plaintext_buf[FF_MAX_SS];
-		BYTE ciphertext_buf[FF_MAX_SS];
-		BYTE tag[XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE];
+		BYTE ciphertext_buf[FF_MAX_SS + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE];
 		BYTE block_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
 
 		// Calculate how much to write in this sector
@@ -4221,33 +4206,22 @@ FRESULT f_crypt_write (
 				return res;
 			}
 
-			// Read existing encrypted sector
+			// Read existing encrypted sector + tag
 			UINT read_count;
-			res = f_read(fp, ciphertext_buf, sector_size, &read_count);
+			res = f_read(fp, ciphertext_buf, sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE, &read_count);
 			if (res != FR_OK) {
 				// Sector doesn't exist yet (writing past EOF), use zeros
 				memset(plaintext_buf, 0, sector_size);
-			} else if (read_count == sector_size) {
-				// Read tag
-				BYTE old_tag[16];
-				res = f_read(fp, old_tag, 16, &read_count);
-				if (res != FR_OK || read_count != 16) {
-	 					memset(plaintext_buf, 0, sector_size);
-	 			} else {
-					// Decrypt existing sector
-					memcpy(block_nonce, base_nonce, 12);
-					block_nonce[8] ^= (block_idx >> 24) & 0xFF;
-					block_nonce[9] ^= (block_idx >> 16) & 0xFF;
-					block_nonce[10] ^= (block_idx >> 8) & 0xFF;
-					block_nonce[11] ^= block_idx & 0xFF;
+			} else if (read_count == sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE) {
+				// Decrypt existing sector
+				fatcrypt_derive_block_nonce(base_nonce, block_idx, block_nonce);
 
-					if (fatcrypt_decrypt_block(ciphertext_buf, sector_size, old_tag,
-					                            fs->master_key, sizeof(fs->master_key),
-					                            block_nonce, sizeof(block_nonce),
-					                            NULL, 0, plaintext_buf) != 0) {
-						// Decryption failed, use zeros
-						memset(plaintext_buf, 0, sector_size);
-					}
+				if (fatcrypt_decrypt_block(ciphertext_buf, sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
+				                            fs->master_key, sizeof(fs->master_key),
+				                            block_nonce, sizeof(block_nonce),
+				                            NULL, 0, plaintext_buf) != 0) {
+					// Decryption failed, use zeros
+					memset(plaintext_buf, 0, sector_size);
 				}
 			} else {
 				memset(plaintext_buf, 0, sector_size);
@@ -4268,33 +4242,23 @@ FRESULT f_crypt_write (
 		}
 
 		// Generate per-block nonce
-		memcpy(block_nonce, base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
-		block_nonce[8] ^= (block_idx >> 24) & 0xFF;
-		block_nonce[9] ^= (block_idx >> 16) & 0xFF;
-		block_nonce[10] ^= (block_idx >> 8) & 0xFF;
-		block_nonce[11] ^= block_idx & 0xFF;
+		fatcrypt_derive_block_nonce(base_nonce, block_idx, block_nonce);
 
 		// Encrypt the block
 		if (fatcrypt_encrypt_block(plaintext_buf, sector_size,
 		                            fs->master_key, sizeof(fs->master_key),
 		                            block_nonce, sizeof(block_nonce),
 		                            NULL, 0,
-		                            ciphertext_buf, tag) != 0) {
+		                            ciphertext_buf) != 0) {
 			return FR_INT_ERR;
 		}
 
-		// Write ciphertext
+		// Write ciphertext + tag
 		UINT written;
-		res = f_write(fp, ciphertext_buf, sector_size, &written);
-		if (res != FR_OK || written != sector_size) {
+		res = f_write(fp, ciphertext_buf, sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE, &written);
+		if (res != FR_OK || written != sector_size + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE) {
 			return res != FR_OK ? res : FR_INT_ERR;
 		}
-
-		// Write tag
-		res = f_write(fp, tag, XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE, &written);
-		if (res != FR_OK || written != XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE) {
- 			return res != FR_OK ? res : FR_INT_ERR;
- 		}
 
 		*bw += chunk_size;
 		input += chunk_size;

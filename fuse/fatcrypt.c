@@ -870,59 +870,54 @@ int fatcrypt_is_plaintext_path(const char *path, const fatcrypt_plaintext_t *pla
 // For now, use a fixed nonce (insecure but allows testing)
 void fatcrypt_derive_file_nonce(uint32_t sclust, uint8_t *nonce_out) {
 	(void)sclust;  // Unused for now
-	memset(nonce_out, 0, 12);
+	memset(nonce_out, 0, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
+}
+
+// Derive per-block nonce by XORing block index into last 4 bytes of base nonce
+void fatcrypt_derive_block_nonce(const uint8_t *base_nonce, uint32_t block_idx, uint8_t *block_nonce_out) {
+	memcpy(block_nonce_out, base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
+	block_nonce_out[20] ^= (block_idx >> 24) & 0xFF;
+	block_nonce_out[21] ^= (block_idx >> 16) & 0xFF;
+	block_nonce_out[22] ^= (block_idx >> 8) & 0xFF;
+	block_nonce_out[23] ^= block_idx & 0xFF;
 }
 
 // Encrypt a block of data using XChaCha20-Poly1305
+// ciphertext_out must have space for plaintext_len + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE bytes
 int fatcrypt_encrypt_block(const uint8_t *plaintext, size_t plaintext_len,
                             const uint8_t *key, size_t key_len,
                             const uint8_t *nonce, size_t nonce_len,
                             const uint8_t *aad, size_t aad_len,
-                            uint8_t *ciphertext_out, uint8_t *tag_out) {
-	uint8_t tmp_out[XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE+plaintext_len];
+                            uint8_t *ciphertext_out) {
 	if (!plaintext || !key || !nonce || !ciphertext_out) {
 		fprintf(stderr, "Invalid parameters for encrypt_block\n");
 		return -1;
 	}
 
-	if (wc_XChaCha20Poly1305_Encrypt(
-		tmp_out, plaintext_len+XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
+	return wc_XChaCha20Poly1305_Encrypt(
+		ciphertext_out, plaintext_len + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
 		plaintext, plaintext_len,
 		aad, aad_len,
 		nonce, nonce_len,
 		key, key_len
-	) != 0) {
-		return -1;
-	}
-	// layout: ciphertext[plaintext_len], tag[tag_len]
-	// this is stupid but I don't want to rewrite the block
-	// handling code so I'm just going to split the tag here
-	memcpy(ciphertext_out, tmp_out, plaintext_len);
-	memcpy(tag_out, tmp_out+plaintext_len, XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
-	return 0;
+	);
 }
 
 // Decrypt a block of data using XChaCha20-Poly1305
+// ciphertext_len includes the tag (plaintext will be ciphertext_len - XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE bytes)
 int fatcrypt_decrypt_block(const uint8_t *ciphertext, size_t ciphertext_len,
-                            const uint8_t *tag,
                             const uint8_t *key, size_t key_len,
                             const uint8_t *nonce, size_t nonce_len,
                             const uint8_t *aad, size_t aad_len,
                             uint8_t *plaintext_out) {
-	uint8_t tmp_in[XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE+ciphertext_len];
 	if (!ciphertext || !key || !nonce || !plaintext_out) {
 		fprintf(stderr, "Invalid parameters for decrypt_block\n");
 		return -1;
 	}
 
-	// layout: ciphertext[plaintext_len], tag[tag_len]
-	// this is stupid but I don't want to rewrite the block
-	// handling code so I'm just going to merge the tag here
-	memcpy(tmp_in, ciphertext, ciphertext_len);
-	memcpy(tmp_in+ciphertext_len, tag, XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE);
 	return wc_XChaCha20Poly1305_Decrypt(
-		plaintext_out, ciphertext_len,
-		tmp_in, ciphertext_len+XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
+		plaintext_out, ciphertext_len - XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE,
+		ciphertext, ciphertext_len,
 		aad, aad_len,
 		nonce, nonce_len,
 		key, key_len
