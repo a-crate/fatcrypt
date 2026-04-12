@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+typedef unsigned char	BYTE;
+
 #define FATCRYPT_MAGIC "FATCRYPT"
 #define FATCRYPT_VERSION 0x01
 
@@ -27,6 +29,21 @@
 // Master key blob magic
 #define FATCRYPT_MASTER_MAGIC "FCMASTER"
 #define FATCRYPT_MASTER_VERSION 0x01
+
+// File header [section (bytes)]
+// [magic (8)][version (1)][logical size (8)][nonce (24)]
+#define FATCRYPT_MAGIC_SIZE 8
+#define FATCRYPT_VERSION_SIZE 1
+#define FATCRYPT_LSIZE_SIZE 8
+
+#define FATCRYPT_HEADER_SIZE 41
+
+typedef struct {
+	char magic[FATCRYPT_MAGIC_SIZE]; // FATCRYPT
+	uint8_t version; // 0x01
+	uint64_t logical_size; // should really be FSIZE_t but the largest that can be is QWORD and I don't want to deal with the header conflicts between fatfs and wolfcrypt
+    BYTE base_nonce[XCHACHA20_POLY1305_AEAD_NONCE_SIZE];
+} fatcrypt_header_t;
 
 // Keygen configuration
 typedef struct {

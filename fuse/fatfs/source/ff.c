@@ -3641,8 +3641,95 @@ static FRESULT validate (	/* Returns FR_OK or FR_INVALID_OBJECT */
 	return res;
 }
 
+/*--------------------------*/
+/* Internal crypto functions */
+/*--------------------------*/
 
+/*-------------------*/
+/* Parse file header */
+/* mangles seek pos  */
+/*-------------------*/
+FRESULT parse_fatcrypt_header(
+	FIL *fp, // File pointer
+	fatcrypt_header_t *out // Result storage
+)
+{
+	FRESULT res;
+	UINT header_read;
 
+	if (fp->obj.objsize == 0) {
+		return FR_NO_HEADER;
+	}
+	res = f_lseek(fp, 0);
+	if (res != FR_OK) return res;
+
+	res = f_read(fp, out->magic, FATCRYPT_MAGIC_SIZE, &header_read);
+	if (res != FR_OK) return res;
+	if (header_read < FATCRYPT_MAGIC_SIZE) {
+		return FR_INT_ERR;
+	}
+	if (memcmp(FATCRYPT_MAGIC, out->magic, FATCRYPT_MAGIC_SIZE) != 0) {
+		return FR_BAD_HEADER;
+	}
+
+	res = f_read(fp, &out->version, FATCRYPT_VERSION_SIZE, &header_read);
+	if (res != FR_OK) return res;
+	if (header_read < FATCRYPT_VERSION_SIZE) {
+		return FR_INT_ERR;
+	}
+	if (FATCRYPT_VERSION != out -> version) {
+		return FR_BAD_HEADER;
+	}
+
+	BYTE size_header[FATCRYPT_LSIZE_SIZE];
+	res = f_read(fp, size_header, FATCRYPT_LSIZE_SIZE, &header_read);
+	if (res != FR_OK) return res;
+	if (header_read < FATCRYPT_LSIZE_SIZE) {
+		return FR_INT_ERR;
+	}
+	out->logical_size = 0;
+	for (int i = 0; i < FATCRYPT_LSIZE_SIZE; i++) {
+		out->logical_size |= ((FSIZE_t)size_header[i]) << (i * 8);
+	}
+
+	res = f_read(fp, out->base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE, &header_read);
+	if (res != FR_OK) return res;
+	if (header_read < XCHACHA20_POLY1305_AEAD_NONCE_SIZE) {
+		return FR_INT_ERR;
+	}
+	return FR_OK;
+}
+
+/*-------------------*/
+/* Build file header */
+/* mangles seek pos  */
+/*-------------------*/
+FRESULT update_fatcrypt_header(
+	FIL *fp, // File pointer
+	fatcrypt_header_t *header // input header
+)
+{
+	uint8_t write[FATCRYPT_HEADER_SIZE] = {0};
+	UINT header_write;
+	FRESULT res;
+
+	memcpy(write, header->magic, FATCRYPT_MAGIC_SIZE);
+	memcpy(write+FATCRYPT_MAGIC_SIZE, &header->version, FATCRYPT_VERSION_SIZE);
+	for (int i = 0; i < FATCRYPT_LSIZE_SIZE; i++) {
+		write[FATCRYPT_MAGIC_SIZE + FATCRYPT_VERSION_SIZE + i] = (header->logical_size >> (i * 8)) & 0xFF;
+	}
+	memcpy(write+FATCRYPT_MAGIC_SIZE+FATCRYPT_VERSION_SIZE+FATCRYPT_LSIZE_SIZE, header->base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
+
+	res = f_lseek(fp, 0);
+	if (res != FR_OK) return res;
+
+	res = f_write(fp, write, FATCRYPT_HEADER_SIZE, &header_write);
+	if (res != FR_OK) return res;
+	if (header_write < FATCRYPT_HEADER_SIZE) {
+		return FR_INT_ERR;
+	}
+	return FR_OK;
+}
 
 /*---------------------------------------------------------------------------
 

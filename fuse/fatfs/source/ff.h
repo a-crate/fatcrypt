@@ -296,7 +296,8 @@ typedef enum {
 	FR_NOT_ENOUGH_CORE,		/* (17) LFN working buffer could not be allocated */
 	FR_TOO_MANY_OPEN_FILES,	/* (18) Number of open files > FF_FS_LOCK */
 	FR_INVALID_PARAMETER,	/* (19) Given parameter is invalid */
-	FR_NO_HEADER			/* (20) missing encryption header. */
+	FR_NO_HEADER,			/* (20) missing encryption header. */
+	FR_BAD_HEADER			/* (21) malformed encryption header. */
 } FRESULT;
 
 
