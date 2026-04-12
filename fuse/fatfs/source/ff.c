@@ -3647,7 +3647,6 @@ static FRESULT validate (	/* Returns FR_OK or FR_INVALID_OBJECT */
 
 /*-------------------*/
 /* Parse file header */
-/* mangles seek pos  */
 /*-------------------*/
 FRESULT parse_fatcrypt_header(
 	FIL *fp, // File pointer
@@ -3656,36 +3655,42 @@ FRESULT parse_fatcrypt_header(
 {
 	FRESULT res;
 	UINT header_read;
+	FSIZE_t old_pos = fp->fptr;
 
 	if (fp->obj.objsize == 0) {
 		return FR_NO_HEADER;
 	}
 	res = f_lseek(fp, 0);
-	if (res != FR_OK) return res;
+	if (res != FR_OK) goto err;
 
 	res = f_read(fp, out->magic, FATCRYPT_MAGIC_SIZE, &header_read);
-	if (res != FR_OK) return res;
+	if (res != FR_OK) goto err;
 	if (header_read < FATCRYPT_MAGIC_SIZE) {
-		return FR_INT_ERR;
+		res = FR_INT_ERR;
+		goto err;
 	}
 	if (memcmp(FATCRYPT_MAGIC, out->magic, FATCRYPT_MAGIC_SIZE) != 0) {
-		return FR_BAD_HEADER;
+		res = FR_BAD_HEADER;
+		goto err;
 	}
 
 	res = f_read(fp, &out->version, FATCRYPT_VERSION_SIZE, &header_read);
-	if (res != FR_OK) return res;
+	if (res != FR_OK) goto err;
 	if (header_read < FATCRYPT_VERSION_SIZE) {
-		return FR_INT_ERR;
+		res = FR_INT_ERR;
+		goto err;
 	}
 	if (FATCRYPT_VERSION != out -> version) {
-		return FR_BAD_HEADER;
+		res = FR_BAD_HEADER;
+		goto err;
 	}
 
 	BYTE size_header[FATCRYPT_LSIZE_SIZE];
 	res = f_read(fp, size_header, FATCRYPT_LSIZE_SIZE, &header_read);
-	if (res != FR_OK) return res;
+	if (res != FR_OK) goto err;
 	if (header_read < FATCRYPT_LSIZE_SIZE) {
-		return FR_INT_ERR;
+		res = FR_INT_ERR;
+		goto err;
 	}
 	out->logical_size = 0;
 	for (int i = 0; i < FATCRYPT_LSIZE_SIZE; i++) {
@@ -3693,16 +3698,20 @@ FRESULT parse_fatcrypt_header(
 	}
 
 	res = f_read(fp, out->base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE, &header_read);
-	if (res != FR_OK) return res;
+	if (res != FR_OK) goto err;
 	if (header_read < XCHACHA20_POLY1305_AEAD_NONCE_SIZE) {
-		return FR_INT_ERR;
+		res = FR_INT_ERR;
+		goto err;
 	}
-	return FR_OK;
+
+	return f_lseek(fp, old_pos);
+	err:
+	f_lseek(fp, old_pos);
+	return res;
 }
 
 /*-------------------*/
 /* Build file header */
-/* mangles seek pos  */
 /*-------------------*/
 FRESULT update_fatcrypt_header(
 	FIL *fp, // File pointer
@@ -3712,6 +3721,7 @@ FRESULT update_fatcrypt_header(
 	uint8_t write[FATCRYPT_HEADER_SIZE] = {0};
 	UINT header_write;
 	FRESULT res;
+	FSIZE_t old_pos = fp->fptr;
 
 	memcpy(write, header->magic, FATCRYPT_MAGIC_SIZE);
 	memcpy(write+FATCRYPT_MAGIC_SIZE, &header->version, FATCRYPT_VERSION_SIZE);
@@ -3721,14 +3731,19 @@ FRESULT update_fatcrypt_header(
 	memcpy(write+FATCRYPT_MAGIC_SIZE+FATCRYPT_VERSION_SIZE+FATCRYPT_LSIZE_SIZE, header->base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
 
 	res = f_lseek(fp, 0);
-	if (res != FR_OK) return res;
+	if (res != FR_OK) goto err;
 
 	res = f_write(fp, write, FATCRYPT_HEADER_SIZE, &header_write);
-	if (res != FR_OK) return res;
+	if (res != FR_OK) goto err;
 	if (header_write < FATCRYPT_HEADER_SIZE) {
-		return FR_INT_ERR;
+		res = FR_INT_ERR;
+		goto err;
 	}
-	return FR_OK;
+
+	return f_lseek(fp, old_pos);
+	err:
+	f_lseek(fp, old_pos);
+	return res;
 }
 
 /*---------------------------------------------------------------------------
