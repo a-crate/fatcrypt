@@ -11,10 +11,15 @@ typedef unsigned char	BYTE;
 #define FATCRYPT_VERSION 0x01
 
 // key derivation for master key password
-#define FATCRYPT_HASH_ALG WC_SHA256
-#define FATCRYPT_3DS_ITERATIONS 1500
-#define FATCRYPT_ITERATIONS 100000
-#define FATCRYPT_SALT_SIZE 16        // 128 bits for pbkdf2
+#define FATCRYPT_SALT_SIZE 16        // 128 bits for scrypt
+// scrypt parameters for normal usage (moderate security)
+#define FATCRYPT_SCRYPT_COST 15      // N = 2^15 = 32768
+#define FATCRYPT_SCRYPT_BLOCK_SIZE 8 // r = 8
+#define FATCRYPT_SCRYPT_PARALLEL 1   // p = 1
+// scrypt parameters for 3DS (lower memory)
+#define FATCRYPT_3DS_SCRYPT_COST 13  // N = 2^13 = 8192
+#define FATCRYPT_3DS_SCRYPT_BLOCK_SIZE 8
+#define FATCRYPT_3DS_SCRYPT_PARALLEL 1
 
 // master key
 #define CHACHA20_POLY1305_AEAD_NONCE_SIZE 12
@@ -59,8 +64,10 @@ typedef struct {
 
 // KDF configuration from config.json
 typedef struct {
-	char *name;                 // KDF name (e.g., "argon2id")
-	unsigned long long iterations;
+	char *name;                 // KDF name (e.g., "scrypt")
+	int cost;                   // scrypt cost parameter (N = 2^cost)
+	int blockSize;              // scrypt block size parameter (r)
+	int parallel;               // scrypt parallelization parameter (p)
 } fatcrypt_kdf_config_t;
 
 // Plaintext file/directory patterns

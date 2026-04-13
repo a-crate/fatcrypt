@@ -319,7 +319,7 @@ int secretbox_open_easy(
 }
 
 static int store_master_key(const char *path, const uint8_t *key, size_t key_size,
-                            const char *passphrase, unsigned long long iterations) {
+                            const char *passphrase, int cost, int blockSize, int parallel) {
 	FILE *f = fopen(path, "wb");
 	if (!f) {
 		fprintf(stderr, "Failed to create master key file %s: %s\n", path, strerror(errno));
@@ -352,9 +352,9 @@ static int store_master_key(const char *path, const uint8_t *key, size_t key_siz
 			return -1;
 		}
 
-		if (wc_PBKDF2(derived_key, (const unsigned char *)passphrase, strlen(passphrase),
-		                  salt, sizeof(salt), iterations, CHACHA20_POLY1305_AEAD_KEYSIZE, FATCRYPT_HASH_ALG) != 0) {
-			fprintf(stderr, "PBKDF2 key derivation failed\n");
+		if (wc_scrypt(derived_key, (const unsigned char *)passphrase, strlen(passphrase),
+		              salt, sizeof(salt), cost, blockSize, parallel, CHACHA20_POLY1305_AEAD_KEYSIZE) != 0) {
+			fprintf(stderr, "scrypt key derivation failed\n");
 			fclose(f);
 			unlink(path);
 			return -1;
@@ -459,14 +459,32 @@ int fatcrypt_load_config(const char *config_path, fatcrypt_config_t *config) {
 	}
 	config->kdf.name = strdup(json_object_get_string(kdf_name_obj));
 
-	struct json_object *iterations_obj;
-	if (!json_object_object_get_ex(kdf_obj, "iterations", &iterations_obj)) {
-		fprintf(stderr, "config.json kdf missing 'iterations' field\n");
+	struct json_object *cost_obj;
+	if (!json_object_object_get_ex(kdf_obj, "cost", &cost_obj)) {
+		fprintf(stderr, "config.json kdf missing 'cost' field\n");
 		free(config->kdf.name);
 		json_object_put(root);
 		return -1;
 	}
-	config->kdf.iterations = json_object_get_uint64(iterations_obj);
+	config->kdf.cost = json_object_get_int(cost_obj);
+
+	struct json_object *blockSize_obj;
+	if (!json_object_object_get_ex(kdf_obj, "blockSize", &blockSize_obj)) {
+		fprintf(stderr, "config.json kdf missing 'blockSize' field\n");
+		free(config->kdf.name);
+		json_object_put(root);
+		return -1;
+	}
+	config->kdf.blockSize = json_object_get_int(blockSize_obj);
+
+	struct json_object *parallel_obj;
+	if (!json_object_object_get_ex(kdf_obj, "parallel", &parallel_obj)) {
+		fprintf(stderr, "config.json kdf missing 'parallel' field\n");
+		free(config->kdf.name);
+		json_object_put(root);
+		return -1;
+	}
+	config->kdf.parallel = json_object_get_int(parallel_obj);
 
 	// Parse plaintext (optional)
 	struct json_object *plaintext_obj;
@@ -802,8 +820,9 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 
 	// Derive key from passphrase using config parameters
 	uint8_t derived_key[CHACHA20_POLY1305_AEAD_KEYSIZE];
-	if (wc_PBKDF2(derived_key, (const unsigned char *)passphrase, strlen(passphrase),
-	                  salt, sizeof(salt), config->kdf.iterations, CHACHA20_POLY1305_AEAD_KEYSIZE, FATCRYPT_HASH_ALG) != 0 ) {
+	if (wc_scrypt(derived_key, (const unsigned char *)passphrase, strlen(passphrase),
+	              salt, sizeof(salt), config->kdf.cost, config->kdf.blockSize, config->kdf.parallel,
+	              CHACHA20_POLY1305_AEAD_KEYSIZE) != 0) {
 		fprintf(stderr, "Key derivation failed\n");
 		return -1;
 	}
@@ -971,7 +990,9 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 		goto cleanup;
 	}
 
-	unsigned long long iterations = config->use_3ds_defaults ? FATCRYPT_3DS_ITERATIONS : FATCRYPT_ITERATIONS;
+	int cost = config->use_3ds_defaults ? FATCRYPT_3DS_SCRYPT_COST : FATCRYPT_SCRYPT_COST;
+	int blockSize = config->use_3ds_defaults ? FATCRYPT_3DS_SCRYPT_BLOCK_SIZE : FATCRYPT_SCRYPT_BLOCK_SIZE;
+	int parallel = config->use_3ds_defaults ? FATCRYPT_3DS_SCRYPT_PARALLEL : FATCRYPT_SCRYPT_PARALLEL;
 
 	printf("Writing config.json...\n");
 	snprintf(path_buf, sizeof(path_buf), "%s/.fat_crypt/config.json", config->mountpoint_dir);
@@ -982,8 +1003,10 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 
 	// Add KDF section
 	struct json_object *kdf = json_object_new_object();
-	json_object_object_add(kdf, "name", json_object_new_string("pbkdf2"));
-	json_object_object_add(kdf, "iterations", json_object_new_uint64(iterations));
+	json_object_object_add(kdf, "name", json_object_new_string("scrypt"));
+	json_object_object_add(kdf, "cost", json_object_new_int(cost));
+	json_object_object_add(kdf, "blockSize", json_object_new_int(blockSize));
+	json_object_object_add(kdf, "parallel", json_object_new_int(parallel));
 	json_object_object_add(root, "kdf", kdf);
 
 	// Add plaintext section
@@ -1023,7 +1046,7 @@ int fatcrypt_keygen(const fatcrypt_keygen_config_t *config) {
 	// Store master key at .fat_crypt/keys/master.blob
 	snprintf(master_key_path, sizeof(master_key_path), "%s/.fat_crypt/keys/master.blob", config->mountpoint_dir);
 	printf("Storing master key to %s...\n", master_key_path);
-	if (store_master_key(master_key_path, master_key, CHACHA20_POLY1305_AEAD_KEYSIZE, passphrase, iterations) != 0) {
+	if (store_master_key(master_key_path, master_key, CHACHA20_POLY1305_AEAD_KEYSIZE, passphrase, cost, blockSize, parallel) != 0) {
 		goto cleanup;
 	}
 

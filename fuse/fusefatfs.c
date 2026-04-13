@@ -561,7 +561,9 @@ static struct fftab *fff_init(const char *source, const char *mountpoint, int co
 		// Initialize config with defaults (will be loaded if master key provided)
 		ffentry->config.version = 1;
 		ffentry->config.kdf.name = NULL;
-		ffentry->config.kdf.iterations = 0;
+		ffentry->config.kdf.cost = 0;
+		ffentry->config.kdf.blockSize = 0;
+		ffentry->config.kdf.parallel = 0;
 		ffentry->config.plaintext.files = NULL;
 		ffentry->config.plaintext.files_count = 0;
 		ffentry->config.plaintext.directories = NULL;

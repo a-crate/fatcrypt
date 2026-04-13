@@ -5,7 +5,7 @@
 
 /* Features we need */
 #define HAVE_HKDF
-#define HAVE_PBKDF2
+#define HAVE_SCRYPT
 #define WOLFSSL_SHA256
 #define HAVE_CHACHA
 #define HAVE_XCHACHA
