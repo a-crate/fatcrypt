@@ -424,17 +424,24 @@ write_err:
 	return -1;
 }
 
-// Load config.json from mountpoint directory (for keygen)
-int fatcrypt_load_config(const char *config_path, fatcrypt_config_t *config) {
+// Load config from buffer
+int fatcrypt_load_config(const void *buf, size_t buf_size, fatcrypt_config_t *config) {
 	// Initialize plaintext arrays
 	config->plaintext.files = NULL;
 	config->plaintext.files_count = 0;
 	config->plaintext.directories = NULL;
 	config->plaintext.directories_count = 0;
 
-	struct json_object *root = json_object_from_file(config_path);
+	struct json_tokener *tok = json_tokener_new();
+	if (!tok) {
+		fprintf(stderr, "Failed to create JSON tokener\n");
+		return -1;
+	}
+
+	struct json_object *root = json_tokener_parse_ex(tok, buf, buf_size);
+	json_tokener_free(tok);
 	if (!root) {
-		fprintf(stderr, "Failed to load config.json from %s\n", config_path);
+		fprintf(stderr, "Failed to parse config.json\n");
 		return -1;
 	}
 
@@ -719,7 +726,7 @@ int fatcrypt_verify_config(const char *mountpoint_dir, const uint8_t *master_key
 	return 0;
 }
 
-int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase,
+int fatcrypt_load_master_key(const void *buf, size_t buf_size, const char *passphrase,
                         fatcrypt_config_t *config,
                         uint8_t *key_out, size_t key_size) {
 	if (key_size != XCHACHA20_POLY1305_AEAD_KEYSIZE) {
@@ -727,112 +734,104 @@ int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase
 		return -1;
 	}
 
-	FILE *f = fopen(master_key_path, "rb");
-	if (!f) {
-		fprintf(stderr, "Failed to open master key file %s: %s\n", master_key_path, strerror(errno));
+	const uint8_t *p = buf;
+	size_t remaining = buf_size;
+
+	// Verify minimum size for header (magic + version + encrypted flag)
+	if (remaining < 10) {
+		fprintf(stderr, "Master key buffer too small\n");
 		return -1;
 	}
 
 	// Read and verify magic
-	uint8_t magic[8];
-	if (fread(magic, 1, 8, f) != 8 || memcmp(magic, FATCRYPT_MASTER_MAGIC, 8) != 0) {
-		fprintf(stderr, "Invalid magic bytes in master key file\n");
-		fclose(f);
+	if (memcmp(p, FATCRYPT_MASTER_MAGIC, 8) != 0) {
+		fprintf(stderr, "Invalid magic bytes in master key\n");
 		return -1;
 	}
+	p += 8;
+	remaining -= 8;
 
 	// Read version
-	uint8_t version;
-	if (fread(&version, 1, 1, f) != 1) {
-		fprintf(stderr, "Failed to read version from master key file\n");
-		fclose(f);
-		return -1;
-	}
+	uint8_t version = *p++;
+	remaining--;
+	(void)version;
 
 	// Read encrypted flag
-	uint8_t encrypted;
-	if (fread(&encrypted, 1, 1, f) != 1) {
-		fprintf(stderr, "Failed to read encrypted flag from master key file\n");
-		fclose(f);
-		return -1;
-	}
+	uint8_t encrypted = *p++;
+	remaining--;
 
 	if (!encrypted) {
 		// Plaintext key - read size and key directly
-		uint8_t size_bytes[2];
-		if (fread(size_bytes, 1, 2, f) != 2) {
-			fprintf(stderr, "Failed to read key size\n");
-			fclose(f);
+		if (remaining < 2) {
+			fprintf(stderr, "Master key buffer too small for size field\n");
 			return -1;
 		}
-		size_t stored_key_size = (size_bytes[0] << 8) | size_bytes[1];
+		size_t stored_key_size = (p[0] << 8) | p[1];
+		p += 2;
+		remaining -= 2;
 
 		if (stored_key_size != key_size) {
 			fprintf(stderr, "Key size mismatch: %zu != %zu\n", stored_key_size, key_size);
-			fclose(f);
 			return -1;
 		}
 
-		if (fread(key_out, 1, key_size, f) != key_size) {
-			fprintf(stderr, "Failed to read key\n");
-			fclose(f);
+		if (remaining < key_size) {
+			fprintf(stderr, "Master key buffer too small for key\n");
 			return -1;
 		}
 
-		fclose(f);
+		memcpy(key_out, p, key_size);
 		return 0;
 	}
 
 	// Encrypted key - need passphrase
 	if (!passphrase || strlen(passphrase) == 0) {
 		fprintf(stderr, "Master key is encrypted but no passphrase provided\n");
-		fclose(f);
 		return -1;
 	}
 
 	// Read salt
-	uint8_t salt[FATCRYPT_SALT_SIZE];
-	if (fread(salt, 1, sizeof(salt), f) != sizeof(salt)) {
-		fprintf(stderr, "Failed to read salt\n");
-		fclose(f);
+	if (remaining < FATCRYPT_SALT_SIZE) {
+		fprintf(stderr, "Master key buffer too small for salt\n");
 		return -1;
 	}
+	const uint8_t *salt = p;
+	p += FATCRYPT_SALT_SIZE;
+	remaining -= FATCRYPT_SALT_SIZE;
 
 	// Read size
-	uint8_t size_bytes[2];
-	if (fread(size_bytes, 1, 2, f) != 2) {
-		fprintf(stderr, "Failed to read key size\n");
-		fclose(f);
+	if (remaining < 2) {
+		fprintf(stderr, "Master key buffer too small for size field\n");
 		return -1;
 	}
-	size_t stored_key_size = (size_bytes[0] << 8) | size_bytes[1];
+	size_t stored_key_size = (p[0] << 8) | p[1];
+	p += 2;
+	remaining -= 2;
 
 	if (stored_key_size != key_size) {
 		fprintf(stderr, "Key size mismatch: %zu != %zu\n", stored_key_size, key_size);
-		fclose(f);
 		return -1;
 	}
 
 	// Read ciphertext (includes nonce + mac + encrypted key)
-	uint8_t ciphertext[XCHACHA20_POLY1305_AEAD_NONCE_SIZE + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE + XCHACHA20_POLY1305_AEAD_KEYSIZE];
-	if (fread(ciphertext, 1, sizeof(ciphertext), f) != sizeof(ciphertext)) {
-		fprintf(stderr, "Failed to read ciphertext\n");
-		fclose(f);
+	size_t ciphertext_size = XCHACHA20_POLY1305_AEAD_NONCE_SIZE + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE + XCHACHA20_POLY1305_AEAD_KEYSIZE;
+	if (remaining < ciphertext_size) {
+		fprintf(stderr, "Master key buffer too small for ciphertext\n");
 		return -1;
 	}
-	fclose(f);
+	const uint8_t *ciphertext = p;
 
 	// Derive key from passphrase using config parameters
 	uint8_t derived_key[XCHACHA20_POLY1305_AEAD_KEYSIZE];
 	if (wc_scrypt(derived_key, (const unsigned char *)passphrase, strlen(passphrase),
-	              salt, sizeof(salt), config->kdf.cost, config->kdf.blockSize, config->kdf.parallel,
+	              salt, FATCRYPT_SALT_SIZE, config->kdf.cost, config->kdf.blockSize, config->kdf.parallel,
 	              XCHACHA20_POLY1305_AEAD_KEYSIZE) != 0) {
 		fprintf(stderr, "Key derivation failed\n");
 		return -1;
 	}
 
 	// Decrypt master key
-	if (secretbox_open_easy(key_out, ciphertext, sizeof(ciphertext), derived_key) != 0) {
+	if (secretbox_open_easy(key_out, ciphertext, ciphertext_size, derived_key) != 0) {
 		fprintf(stderr, "Decryption failed (wrong passphrase or corrupted data)\n");
 		secure_zero_memory(derived_key, sizeof(derived_key));
 		return -1;

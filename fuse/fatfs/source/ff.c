@@ -7743,3 +7743,56 @@ FRESULT f_setcp (
 }
 #endif	/* FF_CODE_PAGE == 0 */
 
+
+/*-----------------------------------------------------------------------*/
+/* Read entire file into memory buffer                                    */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_preread_file (
+	const TCHAR* path,	/* Pointer to the file path */
+	void** buf_out,		/* Pointer to store allocated buffer */
+	UINT* size_out		/* Pointer to store file size */
+)
+{
+	FRESULT res;
+	FIL fp;
+	FILINFO fno;
+	UINT br;
+	void *buf;
+
+	*buf_out = NULL;
+	*size_out = 0;
+
+	/* Get file info to determine size */
+	res = f_stat(path, &fno);
+	if (res != FR_OK) return res;
+
+	/* Check it's a file, not a directory */
+	if (fno.fattrib & AM_DIR) return FR_INVALID_OBJECT;
+
+	/* Open file for reading */
+	res = f_open(&fp, path, FA_READ);
+	if (res != FR_OK) return res;
+
+	/* Allocate buffer */
+	buf = malloc((size_t)fno.fsize);
+	if (!buf) {
+		f_close(&fp);
+		return FR_NOT_ENOUGH_CORE;
+	}
+
+	/* Read entire file */
+	res = f_read(&fp, buf, (UINT)fno.fsize, &br);
+	if (res != FR_OK || br != (UINT)fno.fsize) {
+		free(buf);
+		f_close(&fp);
+		return (res != FR_OK) ? res : FR_DISK_ERR;
+	}
+
+	f_close(&fp);
+
+	*buf_out = buf;
+	*size_out = (UINT)fno.fsize;
+	return FR_OK;
+}
+

@@ -83,7 +83,7 @@ typedef struct {
 // Functions
 
 // Configuration management
-int fatcrypt_load_config(const char *mountpoint_dir, fatcrypt_config_t *config);
+int fatcrypt_load_config(const void *buf, size_t buf_size, fatcrypt_config_t *config);
 void fatcrypt_free_config(fatcrypt_config_t *config);
 int fatcrypt_sign_config(const char *mountpoint_dir, const uint8_t *master_key, size_t key_size);
 int fatcrypt_verify_config(const char *mountpoint_dir, const uint8_t *master_key, size_t key_size);
@@ -94,7 +94,7 @@ int fatcrypt_is_metadata_path(const char *path);
 
 // Master key management
 int fatcrypt_keygen(const fatcrypt_keygen_config_t *config);
-int fatcrypt_load_master_key(const char *master_key_path, const char *passphrase,
+int fatcrypt_load_master_key(const void *buf, size_t buf_size, const char *passphrase,
                               fatcrypt_config_t *config,
                               uint8_t *master_key_out, size_t key_size);
 

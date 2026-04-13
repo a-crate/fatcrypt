@@ -470,27 +470,14 @@ static int fff_statfs(const char *path, struct statvfs *buf) {
 
 // Helper function to prompt for passphrase if the master key is encrypted
 // Returns: passphrase in provided buffer, or NULL if not needed or failed
-static const char *fff_prompt_passphrase(const char *master_key_path, char *passphrase_buf, size_t buf_size) {
-	struct stat key_stat;
-	if (stat(master_key_path, &key_stat) != 0) {
-		fprintf(stderr, "Master key file not found: %s\n", master_key_path);
+static const char *fff_prompt_passphrase(const void *key_buf, size_t key_buf_size, char *passphrase_buf, size_t buf_size) {
+	// Check minimum size for header (magic + version + encrypted flag)
+	if (key_buf_size < 10) {
+		fprintf(stderr, "Master key buffer too short\n");
 		return NULL;
 	}
 
-	// Check if master key file is encrypted
-	FILE *f = fopen(master_key_path, "rb");
-	if (!f) {
-		fprintf(stderr, "Cannot open master key file: %s\n", master_key_path);
-		return NULL;
-	}
-
-	uint8_t header[10];
-	if (fread(header, 1, 10, f) != 10) {
-		fclose(f);
-		fprintf(stderr, "Master key file too short: %s\n", master_key_path);
-		return NULL;
-	}
-	fclose(f);
+	const uint8_t *header = key_buf;
 
 	// Check encrypted flag (offset 9)
 	if (header[9] != 1) {
@@ -535,7 +522,7 @@ static const char *fff_prompt_passphrase(const char *master_key_path, char *pass
 }
 
 
-static struct fftab *fff_init(const char *source, const char *mountpoint, int codepage, int flags, const char *master_key_path, const char *crypt_config_path) {
+static struct fftab *fff_init(const char *source, const char *mountpoint, int codepage, int flags, int encrypt) {
 	int index = fftab_new(source, flags);
 	if (index >= 0) {
 		struct fftab *ffentry = fftab_get(index);
@@ -558,7 +545,7 @@ static struct fftab *fff_init(const char *source, const char *mountpoint, int co
 		snprintf(ffentry->mountpoint_dir, sizeof(ffentry->mountpoint_dir), "%s", mountpoint);
 		snprintf(ffentry->fs.mountpoint_dir, sizeof(ffentry->fs.mountpoint_dir), "%s", mountpoint);
 
-		// Initialize config with defaults (will be loaded if master key provided)
+		// Initialize config with defaults (will be loaded if encryption enabled)
 		ffentry->config.version = 1;
 		ffentry->config.kdf.name = NULL;
 		ffentry->config.kdf.cost = 0;
@@ -570,13 +557,42 @@ static struct fftab *fff_init(const char *source, const char *mountpoint, int co
 		ffentry->config.plaintext.directories_count = 0;
 		ffentry->fs.master_key_loaded = 0;
 
-		// Only perform crypto initialization if master key path was provided
-		if (master_key_path != NULL) {
-			fprintf(stderr, "Initializing encryption with master key from: %s\n", master_key_path);
+		// Only perform crypto initialization if encryption is enabled
+		if (encrypt) {
+			fprintf(stderr, "Initializing encryption from .fat_crypt/\n");
 
-			// Load config.json from FAT filesystem (includes plaintext configuration)
-			if (fatcrypt_load_config(crypt_config_path, &ffentry->config) != 0) {
-				fprintf(stderr, "Error: Could not load config.json from filesystem\n");
+			// Read config.json from FAT filesystem
+			char config_path[64];
+			snprintf(config_path, sizeof(config_path), "%d:/.fat_crypt/config.json", index);
+			void *config_buf = NULL;
+			UINT config_size = 0;
+			fres = f_preread_file(config_path, &config_buf, &config_size);
+			if (fres != FR_OK) {
+				fprintf(stderr, "Error: Could not read .fat_crypt/config.json (error %d)\n", fres);
+				f_mount(0, sdrv, 1);
+				fftab_del(index);
+				return NULL;
+			}
+
+			// Parse config
+			if (fatcrypt_load_config(config_buf, config_size, &ffentry->config) != 0) {
+				fprintf(stderr, "Error: Could not parse config.json\n");
+				free(config_buf);
+				f_mount(0, sdrv, 1);
+				fftab_del(index);
+				return NULL;
+			}
+			free(config_buf);
+
+			// Read master key from FAT filesystem
+			char key_path[64];
+			snprintf(key_path, sizeof(key_path), "%d:/.fat_crypt/keys/master.blob", index);
+			void *key_buf = NULL;
+			UINT key_size = 0;
+			fres = f_preread_file(key_path, &key_buf, &key_size);
+			if (fres != FR_OK) {
+				fprintf(stderr, "Error: Could not read .fat_crypt/keys/master.blob (error %d)\n", fres);
+				fatcrypt_free_config(&ffentry->config);
 				f_mount(0, sdrv, 1);
 				fftab_del(index);
 				return NULL;
@@ -584,22 +600,23 @@ static struct fftab *fff_init(const char *source, const char *mountpoint, int co
 
 			// Prompt for passphrase if master key is encrypted
 			char passphrase_buf[256] = {0};
-			const char *passphrase = fff_prompt_passphrase(master_key_path, passphrase_buf, sizeof(passphrase_buf));
+			const char *passphrase = fff_prompt_passphrase(key_buf, key_size, passphrase_buf, sizeof(passphrase_buf));
 
-			// Load master key from host filesystem (using already-loaded config)
-			if (fatcrypt_load_master_key(master_key_path, passphrase, &ffentry->config,
+			// Load master key
+			if (fatcrypt_load_master_key(key_buf, key_size, passphrase, &ffentry->config,
 			                              ffentry->fs.master_key,
 			                              sizeof(ffentry->fs.master_key)) != 0) {
-				fprintf(stderr, "Error: Could not load master key from %s\n", master_key_path);
-				// Clear passphrase from memory
+				fprintf(stderr, "Error: Could not load master key\n");
 				if (passphrase) {
 					memset(passphrase_buf, 0, sizeof(passphrase_buf));
 				}
+				free(key_buf);
 				fatcrypt_free_config(&ffentry->config);
 				f_mount(0, sdrv, 1);
 				fftab_del(index);
 				return NULL;
 			}
+			free(key_buf);
 
 			ffentry->fs.master_key_loaded = 1;
 			fprintf(stderr, "Master key loaded successfully\n");
@@ -611,7 +628,7 @@ static struct fftab *fff_init(const char *source, const char *mountpoint, int co
 
 			fprintf(stderr, "Crypto initialization complete, filesystem ready for mount\n");
 		} else {
-			fprintf(stderr, "No master key provided, mounting without encryption\n");
+			fprintf(stderr, "Mounting without encryption\n");
 		}
 
 		return ffentry;
@@ -677,8 +694,7 @@ static void usage(void)
 			"    -o rw     enable write support only together with -force\n"
 			"    -o force  enable write support only together with -rw\n"
 			"    -o codepage=XXX         set codepage (default 850)\n"
-			"    -k, --master-key PATH   path to master key (enables encryption)\n"
-			"    -o master_key=PATH      path to master key (alternative syntax)\n"
+			"    -e, --encrypt           enable encryption (reads key and config from .fat_crypt/)\n"
 			"\n"
 			"keygen options:\n"
 			"    -p, --passphrase=PASS      passphrase to protect master key\n"
@@ -694,8 +710,7 @@ static void usage(void)
 struct options {
 	const char *source;
 	const char *mountpoint;
-	const char *master_key_path;
-	const char *crypt_config_path;
+	int encrypt;
 	int ro;
 	int rw;
 	int rwplus;
@@ -712,12 +727,9 @@ static struct fuse_opt fff_opts[] =
 	FFF_OPT("rw+", rwplus, 1),
 	FFF_OPT("force", force, 1),
 	FFF_OPT("codepage=%u", codepage, 1),
-	FFF_OPT("master_key=%s", master_key_path, 0),
-	FFF_OPT("-k %s", master_key_path, 0),
-	FFF_OPT("--master-key %s", master_key_path, 0),
-	FFF_OPT("crypt_config=%s", crypt_config_path, 0),
-	FFF_OPT("-c %s", crypt_config_path, 0),
-	FFF_OPT("--crypt-config %s", crypt_config_path, 0),
+	FFF_OPT("-e", encrypt, 1),
+	FFF_OPT("--encrypt", encrypt, 1),
+	FFF_OPT("encrypt", encrypt, 1),
 
 	FUSE_OPT_KEY("-V", 'V'),
 	FUSE_OPT_KEY("--version", 'V'),
@@ -867,8 +879,7 @@ int main(int argc, char *argv[])
 	if (options.ro) flags |= FFFF_RDONLY;
 
 	// Initialize filesystem with optional encryption
-	// If master_key_path is provided, crypto init will happen inside fff_init()
-	if ((ffentry = fff_init(options.source, options.mountpoint, options.codepage, flags, options.master_key_path, options.crypt_config_path)) == NULL) {
+	if ((ffentry = fff_init(options.source, options.mountpoint, options.codepage, flags, options.encrypt)) == NULL) {
 		fprintf(stderr, "Filesystem initialization failed\n");
 		goto returnerr;
 	}
