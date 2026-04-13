@@ -1,5 +1,3 @@
-* Stop using fixed nonce
-
 * Derive per-file keys
 
 * Use AAD

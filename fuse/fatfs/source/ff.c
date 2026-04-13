@@ -3671,7 +3671,7 @@ static void fatcrypt_debug(const char *format, ...) {
 /* Initialize header with */
 /* defaults               */
 /*------------------------*/
-void init_fatcrypt_header(
+int init_fatcrypt_header(
 	FIL *fp, // file this header is for
 	fatcrypt_header_t *out // header to initialize
 )
@@ -3681,9 +3681,9 @@ void init_fatcrypt_header(
 	out->version = FATCRYPT_VERSION;
 	out->logical_size = 0;
 	// Derive base nonce from starting cluster
-	fatcrypt_derive_file_nonce(fp->obj.sclust, out->base_nonce);
 	fatcrypt_debug("DEBUG init_fatcrypt_header: magic=%.8s version=%d lsize=%llu\n",
 	        out->magic, out->version, (unsigned long long)out->logical_size);
+	return fatcrypt_read_random_bytes(out->base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
 }
 
 /*-------------------*/
@@ -4382,7 +4382,7 @@ FRESULT f_crypt_write (
 	fatcrypt_debug("DEBUG f_crypt_write: parse_fatcrypt_header returned %d\n", res);
 	if (res == FR_NO_HEADER) {
 		fatcrypt_debug("DEBUG f_crypt_write: calling init_fatcrypt_header\n");
-		init_fatcrypt_header(fp, &fheader);
+		if (init_fatcrypt_header(fp, &fheader) != 0) return FR_INT_ERR;
 		res = write_fatcrypt_header(fp, &fheader);
 		if (res != FR_OK) return res;
 	} else if (res != FR_OK) {
@@ -5586,7 +5586,7 @@ FRESULT f_crypt_truncate (
 	if (res == FR_NO_HEADER) {
 		// This file is either corrupt, or it was already zero length.
 		// Write a new header and force truncation to header size.
-		init_fatcrypt_header(fp, &fheader);
+		if (init_fatcrypt_header(fp, &fheader) != 0) return FR_INT_ERR;
 		res = write_fatcrypt_header(fp, &fheader);
 		if (res != FR_OK) return res;
 		physical_size = FATCRYPT_HEADER_SIZE;

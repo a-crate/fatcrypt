@@ -865,14 +865,6 @@ int fatcrypt_is_plaintext_path(const char *path, const fatcrypt_plaintext_t *pla
 	return 0;
 }
 
-// Derive per-file nonce from starting cluster number
-// TODO: implement nonce file for proper per-file nonces
-// For now, use a fixed nonce (insecure but allows testing)
-void fatcrypt_derive_file_nonce(uint32_t sclust, uint8_t *nonce_out) {
-	(void)sclust;  // Unused for now
-	memset(nonce_out, 0, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
-}
-
 // Derive per-block nonce by XORing block index into last 4 bytes of base nonce
 void fatcrypt_derive_block_nonce(const uint8_t *base_nonce, uint32_t block_idx, uint8_t *block_nonce_out) {
 	memcpy(block_nonce_out, base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
