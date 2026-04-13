@@ -100,8 +100,8 @@ int fatcrypt_load_master_key(const void *buf, size_t buf_size, const char *passp
 
 // File / block encryption management
 int fatcrypt_derive_file_key(const uint8_t *master_key, size_t master_key_size,
-                              const uint8_t *file_uuid, size_t uuid_size,
-                              uint8_t *file_key_out, size_t file_key_size);
+                              const uint8_t *file_nonce, size_t nonce_size,
+                              uint8_t *file_key_out);
 void fatcrypt_derive_block_nonce(const uint8_t *base_nonce, uint32_t block_idx, uint8_t *block_nonce_out);
 int fatcrypt_encrypt_block(const uint8_t *plaintext, size_t plaintext_len,
                             const uint8_t *key, size_t key_len,

@@ -3869,6 +3869,39 @@ FRESULT update_fatcrypt_header_lsize(
 	fatcrypt_debug("DEBUG update_fatcrypt_header_lsize: returning %d\n", res);
 	return res;
 }
+
+/*------------------------*/
+/* Derive per-file key    */
+/*------------------------*/
+FRESULT fatcrypt_derive_key(
+	FIL *fp, // file to derive key for
+	const uint8_t *master_key,
+	size_t master_key_size
+)
+{
+	FRESULT res;
+
+	if (fp->crypt_key_derived) return FR_OK;
+
+	res = parse_fatcrypt_header(fp);
+	if (res == FR_NO_HEADER) {
+		res = init_fatcrypt_header(fp);
+		if (res != FR_OK) return res;
+		res = write_fatcrypt_header(fp);
+		if (res != FR_OK) return res;
+	} else if (res != FR_OK) {
+		return res;
+	}
+
+	if (fatcrypt_derive_file_key(master_key, master_key_size,
+		fp->crypt_header.base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE,
+		fp->crypt_key) != 0) {
+		return FR_INT_ERR;
+	}
+
+	fp->crypt_key_derived = 1;
+	return FR_OK;
+}
 /*---------------------------------------------------------------------------
 
    Public Functions (FatFs API)
@@ -4094,6 +4127,8 @@ FRESULT f_open (
 			fp->crypt_logical_fptr = 0;
 			fp->crypt_header_parsed = 0;
 			memset(&fp->crypt_header, 0, sizeof(fp->crypt_header));
+			fp->crypt_key_derived = 0;
+			memset(&fp->crypt_key, 0, sizeof(fp->crypt_key));
 #if !FF_FS_READONLY
 #if !FF_FS_TINY
 			memset(fp->buf, 0, sizeof fp->buf);	/* Clear sector buffer */
@@ -4176,6 +4211,9 @@ FRESULT f_crypt_read (
 	}
 	if (res != FR_OK) return res;
 
+	res = fatcrypt_derive_key(fp, fs->master_key, sizeof(fs->master_key));
+	if (res != FR_OK) return res;
+
 	// Limit read to not exceed logical file size
 	FSIZE_t available_bytes = fp->crypt_header.logical_size - fp->crypt_logical_fptr;
 	if (available_bytes <= 0) {
@@ -4222,7 +4260,7 @@ FRESULT f_crypt_read (
 
 		// Decrypt the block (ciphertext is sector_size which includes tag, plaintext is logical_sector_size)
 		if (fatcrypt_decrypt_block(ciphertext_buf, sector_size,
-		                            fs->master_key, sizeof(fs->master_key),
+		                            fp->crypt_key, sizeof(fp->crypt_key),
 		                            block_nonce, sizeof(block_nonce),
 		                            NULL, 0,
 		                            plaintext_buf) != 0) {
@@ -4398,6 +4436,9 @@ FRESULT f_crypt_write (
 		return res;
 	}
 
+	res = fatcrypt_derive_key(fp, fs->master_key, sizeof(fs->master_key));
+	if (res != FR_OK) return res;
+
 	// crypt_logical_fptr tracks logical position in decrypted data
 	// Calculate starting block index and offset
 	DWORD block_idx = (DWORD)(fp->crypt_logical_fptr / logical_sector_size);
@@ -4445,7 +4486,7 @@ FRESULT f_crypt_write (
 				fatcrypt_derive_block_nonce(fp->crypt_header.base_nonce, block_idx, block_nonce);
 
 				if (fatcrypt_decrypt_block(ciphertext_buf, sector_size,
-				                            fs->master_key, sizeof(fs->master_key),
+				                            fp->crypt_key, sizeof(fp->crypt_key),
 				                            block_nonce, sizeof(block_nonce),
 				                            NULL, 0, plaintext_buf) != 0) {
 					// Decryption failed, use zeros
@@ -4479,7 +4520,7 @@ FRESULT f_crypt_write (
 
 		// Encrypt the block (plaintext is logical_sector_size, output includes tag and fits in sector_size)
 		if (fatcrypt_encrypt_block(plaintext_buf, logical_sector_size,
-		                            fs->master_key, sizeof(fs->master_key),
+		                            fp->crypt_key, sizeof(fp->crypt_key),
 		                            block_nonce, sizeof(block_nonce),
 		                            NULL, 0,
 		                            ciphertext_buf) != 0) {
@@ -4734,6 +4775,8 @@ FRESULT f_close (
 {
 	FRESULT res;
 	FATFS *fs;
+
+	if (fp->crypt_key_derived) memset(fp->crypt_key, 0, sizeof(fp->crypt_key));
 
 #if !FF_FS_READONLY
 	res = f_sync(fp);					/* Flush cached data */

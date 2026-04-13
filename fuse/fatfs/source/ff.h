@@ -214,6 +214,8 @@ typedef struct {
 	FSIZE_t	crypt_logical_fptr;	/* Logical file pointer for encrypted files (position in decrypted data) */
 	fatcrypt_header_t crypt_header; /* fatcrypt header */
 	uint8_t crypt_header_parsed; /* whether fatcrypt header was parsed from disk */
+	uint8_t crypt_key_derived; /* whether per-file key has been set */
+	uint8_t crypt_key[XCHACHA20_POLY1305_AEAD_KEYSIZE]; /* per-file key */
 #if !FF_FS_READONLY
 	LBA_t	dir_sect;		/* Sector number containing the directory entry (not used at exFAT) */
 	BYTE*	dir_ptr;		/* Pointer to the directory entry in the win[] (not used at exFAT) */

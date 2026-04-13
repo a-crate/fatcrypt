@@ -896,6 +896,15 @@ void fatcrypt_derive_block_nonce(const uint8_t *base_nonce, uint32_t block_idx, 
 	block_nonce_out[23] ^= block_idx & 0xFF;
 }
 
+// Derive per-file key with master key and nonce using HKDF-expand
+int fatcrypt_derive_file_key(const uint8_t *master_key, size_t master_key_size,
+                              const uint8_t *file_nonce, size_t nonce_size,
+                              uint8_t *file_key_out) {
+	return wc_HKDF_Expand(WC_SHA256, master_key, master_key_size,
+	                      file_nonce, nonce_size,
+	                      file_key_out, XCHACHA20_POLY1305_AEAD_KEYSIZE);
+}
+
 // Encrypt a block of data using XChaCha20-Poly1305
 // ciphertext_out must have space for plaintext_len + XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE bytes
 int fatcrypt_encrypt_block(const uint8_t *plaintext, size_t plaintext_len,
