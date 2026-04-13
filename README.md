@@ -20,6 +20,11 @@ I tag a release.
 The implementation in this repository is a FUSE binary for Linux. I plan to port this to Luma3DS.
 Maybe someday I'll port this to grub or systemd-boot for fun.
 
+The FUSE implementation requires selecting the config and master key from outside of the filesystem,
+which obviously allows one to mix up keys and configs, curdle your data, and create really problematic state.
+A good implementation would instead mount the FS read-only, detect the key & config out of `fat_crypt`,
+initialize crypto, and then remount in the final mount mode.
+
 ## Usage
 
 This will walk through setup and usage of an example filesystem on a loopback device.
