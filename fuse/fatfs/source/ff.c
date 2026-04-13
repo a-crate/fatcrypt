@@ -4462,7 +4462,7 @@ FRESULT f_crypt_write (
 	// Only update header if we extended the file
 	fatcrypt_debug("DEBUG f_crypt_write: DONE crypt_logical_fptr=%llu header.lsize=%llu *bw=%u\n",
 	        (unsigned long long)fp->crypt_logical_fptr, (unsigned long long)fheader.logical_size, *bw);
-	if (fp->crypt_logical_fptr > fheader.logical_size) {
+	if (fp->crypt_logical_fptr != fheader.logical_size) {
 		fatcrypt_debug("DEBUG f_crypt_write: file extended, updating header\n");
 		fheader.logical_size = fp->crypt_logical_fptr;
 		return update_fatcrypt_header(fp, &fheader);
