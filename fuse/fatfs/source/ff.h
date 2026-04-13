@@ -27,6 +27,7 @@ extern "C" {
 #endif
 
 #include "ffconf.h"		/* FatFs configuration options */
+#include "fatcrypt.h"
 
 #if FF_DEFINED != FFCONF_DEF
 #error Wrong configuration file (ffconf.h).
@@ -211,6 +212,8 @@ typedef struct {
 	DWORD	clust;			/* Current cluster of fpter (invalid when fptr is 0) */
 	LBA_t	sect;			/* Sector number appearing in buf[] (0:invalid) */
 	FSIZE_t	crypt_logical_fptr;	/* Logical file pointer for encrypted files (position in decrypted data) */
+	fatcrypt_header_t crypt_header; /* fatcrypt header */
+	uint8_t crypt_header_parsed; /* whether fatcrypt header was parsed from disk */
 #if !FF_FS_READONLY
 	LBA_t	dir_sect;		/* Sector number containing the directory entry (not used at exFAT) */
 	BYTE*	dir_ptr;		/* Pointer to the directory entry in the win[] (not used at exFAT) */

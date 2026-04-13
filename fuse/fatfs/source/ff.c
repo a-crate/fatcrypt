@@ -3671,32 +3671,41 @@ static void fatcrypt_debug(const char *format, ...) {
 /* Initialize header with */
 /* defaults               */
 /*------------------------*/
-int init_fatcrypt_header(
-	FIL *fp, // file this header is for
-	fatcrypt_header_t *out // header to initialize
+FRESULT init_fatcrypt_header(
+	FIL *fp // file this header is for
 )
 {
+	if (fp->crypt_header_parsed) {
+		fatcrypt_debug("DEBUG init_fatcrypt_header: skipped because header was already parsed\n");
+		return FR_OK;
+	}
 	fatcrypt_debug("DEBUG init_fatcrypt_header: sclust=%lu\n", (unsigned long)fp->obj.sclust);
-	memcpy(out->magic, FATCRYPT_MAGIC, FATCRYPT_MAGIC_SIZE);
-	out->version = FATCRYPT_VERSION;
-	out->logical_size = 0;
+	memcpy(fp->crypt_header.magic, FATCRYPT_MAGIC, FATCRYPT_MAGIC_SIZE);
+	fp->crypt_header.version = FATCRYPT_VERSION;
+	fp->crypt_header.logical_size = 0;
 	// Derive base nonce from starting cluster
 	fatcrypt_debug("DEBUG init_fatcrypt_header: magic=%.8s version=%d lsize=%llu\n",
-	        out->magic, out->version, (unsigned long long)out->logical_size);
-	return fatcrypt_read_random_bytes(out->base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
+	        fp->crypt_header.magic, fp->crypt_header.version, (unsigned long long)fp->crypt_header.logical_size);
+	if (fatcrypt_read_random_bytes(fp->crypt_header.base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE) != 0) return FR_INT_ERR;
+	fp->crypt_header_parsed = 1;
+	return FR_OK;
 }
 
 /*-------------------*/
 /* Parse file header */
 /*-------------------*/
 FRESULT parse_fatcrypt_header(
-	FIL *fp, // File pointer
-	fatcrypt_header_t *out // Result storage
+	FIL *fp // File pointer
 )
 {
 	FRESULT res;
 	UINT header_read;
 	FSIZE_t old_pos = fp->fptr;
+
+	if (fp->crypt_header_parsed) {
+		fatcrypt_debug("DEBUG parse_fatcrypt_header: skipped because header was already parsed\n");
+		return FR_OK;
+	}
 
 	fatcrypt_debug("DEBUG parse_fatcrypt_header: objsize=%llu sclust=%lu fptr=%llu\n",
 	        (unsigned long long)fp->obj.objsize, (unsigned long)fp->obj.sclust,
@@ -3711,11 +3720,11 @@ FRESULT parse_fatcrypt_header(
 	fatcrypt_debug("DEBUG parse_fatcrypt_header: lseek(0)=%d fptr=%llu\n", res, (unsigned long long)fp->fptr);
 	if (res != FR_OK) goto err;
 
-	res = f_read(fp, out->magic, FATCRYPT_MAGIC_SIZE, &header_read);
+	res = f_read(fp, fp->crypt_header.magic, FATCRYPT_MAGIC_SIZE, &header_read);
 	fatcrypt_debug("DEBUG parse_fatcrypt_header: read magic res=%d read=%u magic=%.8s (hex: %02x%02x%02x%02x%02x%02x%02x%02x)\n",
-	        res, header_read, out->magic,
-	        (unsigned char)out->magic[0], (unsigned char)out->magic[1], (unsigned char)out->magic[2], (unsigned char)out->magic[3],
-	        (unsigned char)out->magic[4], (unsigned char)out->magic[5], (unsigned char)out->magic[6], (unsigned char)out->magic[7]);
+	        res, header_read, fp->crypt_header.magic,
+	        (unsigned char)fp->crypt_header.magic[0], (unsigned char)fp->crypt_header.magic[1], (unsigned char)fp->crypt_header.magic[2], (unsigned char)fp->crypt_header.magic[3],
+	        (unsigned char)fp->crypt_header.magic[4], (unsigned char)fp->crypt_header.magic[5], (unsigned char)fp->crypt_header.magic[6], (unsigned char)fp->crypt_header.magic[7]);
 	if (res != FR_OK || header_read == 0) {
 		fatcrypt_debug("DEBUG parse_fatcrypt_header: read failed or 0 bytes, returning FR_NO_HEADER\n");
 		res = FR_NO_HEADER;
@@ -3726,19 +3735,19 @@ FRESULT parse_fatcrypt_header(
 		res = FR_BAD_HEADER;
 		goto err;
 	}
-	if (memcmp(FATCRYPT_MAGIC, out->magic, FATCRYPT_MAGIC_SIZE) != 0) {
+	if (memcmp(FATCRYPT_MAGIC, fp->crypt_header.magic, FATCRYPT_MAGIC_SIZE) != 0) {
 		fatcrypt_debug("DEBUG parse_fatcrypt_header: magic mismatch, expected FATCRYPT\n");
 		res = FR_BAD_HEADER;
 		goto err;
 	}
 
-	res = f_read(fp, &out->version, FATCRYPT_VERSION_SIZE, &header_read);
+	res = f_read(fp, &fp->crypt_header.version, FATCRYPT_VERSION_SIZE, &header_read);
 	if (res != FR_OK) goto err;
 	if (header_read < FATCRYPT_VERSION_SIZE) {
 		res = FR_INT_ERR;
 		goto err;
 	}
-	if (FATCRYPT_VERSION != out -> version) {
+	if (FATCRYPT_VERSION != fp->crypt_header.version) {
 		res = FR_BAD_HEADER;
 		goto err;
 	}
@@ -3750,21 +3759,21 @@ FRESULT parse_fatcrypt_header(
 		res = FR_INT_ERR;
 		goto err;
 	}
-	out->logical_size = 0;
+	fp->crypt_header.logical_size = 0;
 	for (int i = 0; i < FATCRYPT_LSIZE_SIZE; i++) {
-		out->logical_size |= ((FSIZE_t)size_header[i]) << (i * 8);
+		fp->crypt_header.logical_size |= ((FSIZE_t)size_header[i]) << (i * 8);
 	}
 
-	res = f_read(fp, out->base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE, &header_read);
+	res = f_read(fp, fp->crypt_header.base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE, &header_read);
 	if (res != FR_OK) goto err;
 	if (header_read < XCHACHA20_POLY1305_AEAD_NONCE_SIZE) {
 		res = FR_INT_ERR;
 		goto err;
 	}
 
-	f_lseek(fp, old_pos);
-	fatcrypt_debug("DEBUG parse_fatcrypt_header: SUCCESS lsize=%llu\n", (unsigned long long)out->logical_size);
+	fatcrypt_debug("DEBUG parse_fatcrypt_header: SUCCESS lsize=%llu\n", (unsigned long long)fp->crypt_header.logical_size);
 	res = FR_OK;
+	fp->crypt_header_parsed = 1;
 	err:
 	f_lseek(fp, old_pos);
 	fatcrypt_debug("DEBUG parse_fatcrypt_header: returning %d\n", res);
@@ -3779,8 +3788,7 @@ FRESULT parse_fatcrypt_header(
 /* update_fatcrypt_header_lsize  */
 /*-------------------------------*/
 FRESULT write_fatcrypt_header(
-	FIL *fp, // File pointer
-	fatcrypt_header_t *header // input header
+	FIL *fp // File pointer
 )
 {
 	uint8_t write[FATCRYPT_HEADER_SIZE] = {0};
@@ -3789,15 +3797,15 @@ FRESULT write_fatcrypt_header(
 	FSIZE_t old_pos = fp->fptr;
 
 	fatcrypt_debug("DEBUG write_fatcrypt_header: fptr=%llu magic=%.8s version=%d lsize=%llu\n",
-	        (unsigned long long)old_pos, header->magic, header->version,
-	        (unsigned long long)header->logical_size);
+	        (unsigned long long)old_pos, fp->crypt_header.magic, fp->crypt_header.version,
+	        (unsigned long long)fp->crypt_header.logical_size);
 
-	memcpy(write, header->magic, FATCRYPT_MAGIC_SIZE);
-	memcpy(write+FATCRYPT_MAGIC_SIZE, &header->version, FATCRYPT_VERSION_SIZE);
+	memcpy(write, fp->crypt_header.magic, FATCRYPT_MAGIC_SIZE);
+	memcpy(write+FATCRYPT_MAGIC_SIZE, &fp->crypt_header.version, FATCRYPT_VERSION_SIZE);
 	for (int i = 0; i < FATCRYPT_LSIZE_SIZE; i++) {
-		write[FATCRYPT_MAGIC_SIZE + FATCRYPT_VERSION_SIZE + i] = (header->logical_size >> (i * 8)) & 0xFF;
+		write[FATCRYPT_MAGIC_SIZE + FATCRYPT_VERSION_SIZE + i] = (fp->crypt_header.logical_size >> (i * 8)) & 0xFF;
 	}
-	memcpy(write+FATCRYPT_MAGIC_SIZE+FATCRYPT_VERSION_SIZE+FATCRYPT_LSIZE_SIZE, header->base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
+	memcpy(write+FATCRYPT_MAGIC_SIZE+FATCRYPT_VERSION_SIZE+FATCRYPT_LSIZE_SIZE, fp->crypt_header.base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
 
 	fatcrypt_debug("DEBUG write_fatcrypt_header: write buf[0-7]: %02x%02x%02x%02x%02x%02x%02x%02x\n",
 	        write[0], write[1], write[2], write[3], write[4], write[5], write[6], write[7]);
@@ -3824,8 +3832,7 @@ FRESULT write_fatcrypt_header(
 }
 
 FRESULT update_fatcrypt_header_lsize(
-	FIL *fp, // File pointer
-	fatcrypt_header_t *header // input header
+	FIL *fp // File pointer
 )
 {
 	uint8_t write[FATCRYPT_LSIZE_SIZE] = {0};
@@ -3834,12 +3841,12 @@ FRESULT update_fatcrypt_header_lsize(
 	FSIZE_t old_pos = fp->fptr;
 
 	fatcrypt_debug("DEBUG update_fatcrypt_header_lsize: fptr=%llu lsize=%llu\n",
-	        (unsigned long long)old_pos, header->magic,
-	        (unsigned long long)header->logical_size);
+	        (unsigned long long)old_pos,
+	        (unsigned long long)fp->crypt_header.logical_size);
 
-	memcpy(write, &header->version, FATCRYPT_LSIZE_SIZE);
+	memcpy(write, &fp->crypt_header.version, FATCRYPT_LSIZE_SIZE);
 	for (int i = 0; i < FATCRYPT_LSIZE_SIZE; i++) {
-		write[i] = (header->logical_size >> (i * 8)) & 0xFF;
+		write[i] = (fp->crypt_header.logical_size >> (i * 8)) & 0xFF;
 	}
 
 	res = f_lseek(fp, FATCRYPT_MAGIC_SIZE+FATCRYPT_VERSION_SIZE);
@@ -4085,6 +4092,8 @@ FRESULT f_open (
 			fp->sect = 0;		/* Invalidate current data sector */
 			fp->fptr = 0;		/* Set file pointer top of the file */
 			fp->crypt_logical_fptr = 0;
+			fp->crypt_header_parsed = 0;
+			memset(&fp->crypt_header, 0, sizeof(fp->crypt_header));
 #if !FF_FS_READONLY
 #if !FF_FS_TINY
 			memset(fp->buf, 0, sizeof fp->buf);	/* Clear sector buffer */
@@ -4141,7 +4150,6 @@ FRESULT f_crypt_read (
 {
 	FATFS *fs;
 	FRESULT res;
-	fatcrypt_header_t f_header;
 
 	*br = 0;
 	res = validate(&fp->obj, &fs);
@@ -4160,7 +4168,7 @@ FRESULT f_crypt_read (
 	UINT sector_size = SS(fs);
 	UINT logical_sector_size = sector_size - XCHACHA20_POLY1305_AEAD_AUTHTAG_SIZE;
 
-	res = parse_fatcrypt_header(fp, &f_header);
+	res = parse_fatcrypt_header(fp);
 	if (res == FR_NO_HEADER) {
 		// file is physically zero bytes, no data to read
 		*br = 0;
@@ -4169,7 +4177,7 @@ FRESULT f_crypt_read (
 	if (res != FR_OK) return res;
 
 	// Limit read to not exceed logical file size
-	FSIZE_t available_bytes = f_header.logical_size - fp->crypt_logical_fptr;
+	FSIZE_t available_bytes = fp->crypt_header.logical_size - fp->crypt_logical_fptr;
 	if (available_bytes <= 0) {
 		*br = 0;
 		return FR_OK;  // Already at or past EOF
@@ -4210,7 +4218,7 @@ FRESULT f_crypt_read (
 		}
 
 		// Generate per-block nonce
-		fatcrypt_derive_block_nonce(f_header.base_nonce, block_idx, block_nonce);
+		fatcrypt_derive_block_nonce(fp->crypt_header.base_nonce, block_idx, block_nonce);
 
 		// Decrypt the block (ciphertext is sector_size which includes tag, plaintext is logical_sector_size)
 		if (fatcrypt_decrypt_block(ciphertext_buf, sector_size,
@@ -4356,7 +4364,6 @@ FRESULT f_crypt_write (
 {
 	FATFS *fs;
 	FRESULT res;
-	fatcrypt_header_t fheader;
 
 	*bw = 0;
 	res = validate(&fp->obj, &fs);
@@ -4378,12 +4385,13 @@ FRESULT f_crypt_write (
 	fatcrypt_debug("DEBUG f_crypt_write: START btw=%u fptr=%llu crypt_logical_fptr=%llu\n",
 	        btw, (unsigned long long)fp->fptr, (unsigned long long)fp->crypt_logical_fptr);
 
-	res = parse_fatcrypt_header(fp, &fheader);
+	res = parse_fatcrypt_header(fp);
 	fatcrypt_debug("DEBUG f_crypt_write: parse_fatcrypt_header returned %d\n", res);
 	if (res == FR_NO_HEADER) {
 		fatcrypt_debug("DEBUG f_crypt_write: calling init_fatcrypt_header\n");
-		if (init_fatcrypt_header(fp, &fheader) != 0) return FR_INT_ERR;
-		res = write_fatcrypt_header(fp, &fheader);
+		res = init_fatcrypt_header(fp);
+		if (res != FR_OK) return res;
+		res = write_fatcrypt_header(fp);
 		if (res != FR_OK) return res;
 	} else if (res != FR_OK) {
 		fatcrypt_debug("DEBUG f_crypt_write: parse failed, returning %d\n", res);
@@ -4434,7 +4442,7 @@ FRESULT f_crypt_write (
 				memset(plaintext_buf, 0, logical_sector_size);
 			} else if (read_count == sector_size) {
 				// Decrypt existing sector
-				fatcrypt_derive_block_nonce(fheader.base_nonce, block_idx, block_nonce);
+				fatcrypt_derive_block_nonce(fp->crypt_header.base_nonce, block_idx, block_nonce);
 
 				if (fatcrypt_decrypt_block(ciphertext_buf, sector_size,
 				                            fs->master_key, sizeof(fs->master_key),
@@ -4467,7 +4475,7 @@ FRESULT f_crypt_write (
 		}
 
 		// Generate per-block nonce
-		fatcrypt_derive_block_nonce(fheader.base_nonce, block_idx, block_nonce);
+		fatcrypt_derive_block_nonce(fp->crypt_header.base_nonce, block_idx, block_nonce);
 
 		// Encrypt the block (plaintext is logical_sector_size, output includes tag and fits in sector_size)
 		if (fatcrypt_encrypt_block(plaintext_buf, logical_sector_size,
@@ -4503,11 +4511,11 @@ FRESULT f_crypt_write (
 
 	// Only update header if we changed the file
 	fatcrypt_debug("DEBUG f_crypt_write: DONE crypt_logical_fptr=%llu header.lsize=%llu *bw=%u\n",
-	        (unsigned long long)fp->crypt_logical_fptr, (unsigned long long)fheader.logical_size, *bw);
-	if (fp->crypt_logical_fptr != fheader.logical_size) {
+	        (unsigned long long)fp->crypt_logical_fptr, (unsigned long long)fp->crypt_header.logical_size, *bw);
+	if (fp->crypt_logical_fptr != fp->crypt_header.logical_size) {
 		fatcrypt_debug("DEBUG f_crypt_write: file extended, updating header\n");
-		fheader.logical_size = fp->crypt_logical_fptr;
-		return update_fatcrypt_header_lsize(fp, &fheader);
+		fp->crypt_header.logical_size = fp->crypt_logical_fptr;
+		return update_fatcrypt_header_lsize(fp);
 	}
 
 	fatcrypt_debug("DEBUG f_crypt_write: SUCCESS, no header update needed\n");
@@ -5337,7 +5345,6 @@ FRESULT f_crypt_stat (
 {
 	FRESULT res;
 	FIL fp;
-	fatcrypt_header_t fheader;
 
 	res = f_stat(path, fno);
 	if (res != FR_OK) {
@@ -5352,9 +5359,9 @@ FRESULT f_crypt_stat (
 			return res;
 		}
 		if (fno->fsize >= FATCRYPT_HEADER_SIZE) {
-			res = parse_fatcrypt_header(&fp, &fheader);
+			res = parse_fatcrypt_header(&fp);
 			if (res == FR_OK) {
-				fno->fsize = fheader.logical_size;
+				fno->fsize = fp.crypt_header.logical_size;
 			}
 			// Ignoring other errors is necessary here for
 			// reasons I don't totally understand. Causes problems.
@@ -5556,7 +5563,6 @@ FRESULT f_crypt_truncate (
 	FATFS *fs;
 	FSIZE_t physical_size;
 	UINT sector_size;
-	fatcrypt_header_t fheader;
 
 	res = validate(&fp->obj, &fs);
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) return res;
@@ -5582,12 +5588,13 @@ FRESULT f_crypt_truncate (
 		physical_size = FATCRYPT_HEADER_SIZE;
 	}
 
-	res = parse_fatcrypt_header(fp, &fheader);
+	res = parse_fatcrypt_header(fp);
 	if (res == FR_NO_HEADER) {
 		// This file is either corrupt, or it was already zero length.
 		// Write a new header and force truncation to header size.
-		if (init_fatcrypt_header(fp, &fheader) != 0) return FR_INT_ERR;
-		res = write_fatcrypt_header(fp, &fheader);
+		res = init_fatcrypt_header(fp);
+		if (res != FR_OK) return res;
+		res = write_fatcrypt_header(fp);
 		if (res != FR_OK) return res;
 		physical_size = FATCRYPT_HEADER_SIZE;
 	} else if (res != FR_OK) {
@@ -5602,10 +5609,10 @@ FRESULT f_crypt_truncate (
 	res = f_truncate(fp);
 	if (res != FR_OK) return res;
 
-	fheader.logical_size = logical_size;
+	fp->crypt_header.logical_size = logical_size;
 
 	// Update size header
-	return update_fatcrypt_header_lsize(fp, &fheader);
+	return update_fatcrypt_header_lsize(fp);
 }
 
 
