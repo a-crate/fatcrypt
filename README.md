@@ -67,7 +67,7 @@ use. Do this:
 
 ```
 nix-shell --run make
-install -Dm0755 fuse/build/fusefatfs /usr/bin/fatcrypt
+install -Dm0755 fuse/build/fatcrypt /usr/bin/fatcrypt
 ```
 
 TODO: better docs I guess

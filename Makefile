@@ -1,6 +1,6 @@
 FUSE_DIR = fuse
 FUSE_BUILD_DIR = $(FUSE_DIR)/build
-FUSE_CLI = $(FUSE_BUILD_DIR)/fusefatfs
+FUSE_CLI = $(FUSE_BUILD_DIR)/fatcrypt
 
 .PHONY: all fuse clean
 

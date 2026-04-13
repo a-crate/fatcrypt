@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.12)
-project(fusefatfs
+project(fatcrypt
     VERSION 0.2
-    DESCRIPTION "fuse/vuos module for fat (12/16/32/exfat)"
-    HOMEPAGE_URL "https://github.com/virtualsquare/fusefatfs"
+    DESCRIPTION "a partially encrypted filesystem with the same on-disk format as FAT"
+    HOMEPAGE_URL "https://github.com/a-crate/fatcrypt"
     LANGUAGES C)
 
 include(GNUInstallDirs)
@@ -47,19 +47,9 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_FORTIFY_SOURCE=2 -O2 -pedantic -Wall -Wex
 
 add_definitions(-D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 ${FUSE_CFLAGS} -DFUSE=${FUSE_VERSION})
 
-add_executable(fusefatfs fusefatfs.c fftable.c diskio.c ff.c ffunicode.c fatcrypt.c ${WOLFSSL_SOURCES})
-target_link_libraries(fusefatfs ${FUSE_LIBRARIES} ${SODIUM_LIBRARIES} ${JSON_C_LIBRARIES})
-target_include_directories(fusefatfs PRIVATE ${SODIUM_INCLUDE_DIRS} ${JSON_C_INCLUDE_DIRS})
-install(TARGETS fusefatfs
+add_executable(fatcrypt fusefatfs.c fftable.c diskio.c ff.c ffunicode.c fatcrypt.c ${WOLFSSL_SOURCES})
+target_link_libraries(fatcrypt ${FUSE_LIBRARIES} ${JSON_C_LIBRARIES})
+target_include_directories(fatcrypt PRIVATE ${JSON_C_INCLUDE_DIRS})
+install(TARGETS fatcrypt
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-add_library(vufusefatfs SHARED fusefatfs.c fftable.c diskio.c ff.c ffunicode.c fatcrypt.c ${WOLFSSL_SOURCES})
-set_target_properties(vufusefatfs PROPERTIES PREFIX "")
-install(TARGETS vufusefatfs
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/vu/modules)
-
-add_subdirectory(man)
-
-add_custom_target(uninstall
-  "${CMAKE_COMMAND}" -P "${PROJECT_SOURCE_DIR}/Uninstall.cmake"
-  )
