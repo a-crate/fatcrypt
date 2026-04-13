@@ -3771,10 +3771,14 @@ FRESULT parse_fatcrypt_header(
 	return res;
 }
 
-/*-------------------*/
-/* Build file header */
-/*-------------------*/
-FRESULT update_fatcrypt_header(
+/*-------------------------------*/
+/* Write the full file header    */
+/* once a file header is written */
+/* only the size section should  */
+/* ever be updated. call         */
+/* update_fatcrypt_header_lsize  */
+/*-------------------------------*/
+FRESULT write_fatcrypt_header(
 	FIL *fp, // File pointer
 	fatcrypt_header_t *header // input header
 )
@@ -3784,7 +3788,7 @@ FRESULT update_fatcrypt_header(
 	FRESULT res;
 	FSIZE_t old_pos = fp->fptr;
 
-	fatcrypt_debug("DEBUG update_fatcrypt_header: fptr=%llu magic=%.8s version=%d lsize=%llu\n",
+	fatcrypt_debug("DEBUG write_fatcrypt_header: fptr=%llu magic=%.8s version=%d lsize=%llu\n",
 	        (unsigned long long)old_pos, header->magic, header->version,
 	        (unsigned long long)header->logical_size);
 
@@ -3795,31 +3799,69 @@ FRESULT update_fatcrypt_header(
 	}
 	memcpy(write+FATCRYPT_MAGIC_SIZE+FATCRYPT_VERSION_SIZE+FATCRYPT_LSIZE_SIZE, header->base_nonce, XCHACHA20_POLY1305_AEAD_NONCE_SIZE);
 
-	fatcrypt_debug("DEBUG update_fatcrypt_header: write buf[0-7]: %02x%02x%02x%02x%02x%02x%02x%02x\n",
+	fatcrypt_debug("DEBUG write_fatcrypt_header: write buf[0-7]: %02x%02x%02x%02x%02x%02x%02x%02x\n",
 	        write[0], write[1], write[2], write[3], write[4], write[5], write[6], write[7]);
 
 	res = f_lseek(fp, 0);
-	fatcrypt_debug("DEBUG update_fatcrypt_header: lseek(0)=%d fptr=%llu\n", res, (unsigned long long)fp->fptr);
+	fatcrypt_debug("DEBUG write_fatcrypt_header: lseek(0)=%d fptr=%llu\n", res, (unsigned long long)fp->fptr);
 	if (res != FR_OK) goto err;
 
 	res = f_write(fp, write, FATCRYPT_HEADER_SIZE, &header_write);
-	fatcrypt_debug("DEBUG update_fatcrypt_header: f_write res=%d wrote=%u\n", res, header_write);
+	fatcrypt_debug("DEBUG write_fatcrypt_header: f_write res=%d wrote=%u\n", res, header_write);
 	if (res != FR_OK) goto err;
 	if (header_write < FATCRYPT_HEADER_SIZE) {
-		fatcrypt_debug("DEBUG update_fatcrypt_header: short write\n");
+		fatcrypt_debug("DEBUG write_fatcrypt_header: short write\n");
 		res = FR_INT_ERR;
 		goto err;
 	}
 
-	f_lseek(fp, old_pos);
-	fatcrypt_debug("DEBUG update_fatcrypt_header: SUCCESS\n");
+	fatcrypt_debug("DEBUG write_fatcrypt_header: SUCCESS\n");
 	res = FR_OK;
 	err:
 	f_lseek(fp, old_pos);
-	fatcrypt_debug("DEBUG update_fatcrypt_header: returning %d\n", res);
+	fatcrypt_debug("DEBUG write_fatcrypt_header: returning %d\n", res);
 	return res;
 }
 
+FRESULT update_fatcrypt_header_lsize(
+	FIL *fp, // File pointer
+	fatcrypt_header_t *header // input header
+)
+{
+	uint8_t write[FATCRYPT_LSIZE_SIZE] = {0};
+	UINT header_write;
+	FRESULT res;
+	FSIZE_t old_pos = fp->fptr;
+
+	fatcrypt_debug("DEBUG update_fatcrypt_header_lsize: fptr=%llu lsize=%llu\n",
+	        (unsigned long long)old_pos, header->magic,
+	        (unsigned long long)header->logical_size);
+
+	memcpy(write, &header->version, FATCRYPT_LSIZE_SIZE);
+	for (int i = 0; i < FATCRYPT_LSIZE_SIZE; i++) {
+		write[i] = (header->logical_size >> (i * 8)) & 0xFF;
+	}
+
+	res = f_lseek(fp, FATCRYPT_MAGIC_SIZE+FATCRYPT_VERSION_SIZE);
+	fatcrypt_debug("DEBUG update_fatcrypt_header_lsize: lseek(0)=%d fptr=%llu\n", res, (unsigned long long)fp->fptr);
+	if (res != FR_OK) goto err;
+
+	res = f_write(fp, write, FATCRYPT_LSIZE_SIZE, &header_write);
+	fatcrypt_debug("DEBUG update_fatcrypt_header_lsize: f_write res=%d wrote=%u\n", res, header_write);
+	if (res != FR_OK) goto err;
+	if (header_write < FATCRYPT_LSIZE_SIZE) {
+		fatcrypt_debug("DEBUG update_fatcrypt_header_lsize: short write\n");
+		res = FR_INT_ERR;
+		goto err;
+	}
+
+	fatcrypt_debug("DEBUG update_fatcrypt_header_lsize: SUCCESS\n");
+	res = FR_OK;
+	err:
+	f_lseek(fp, old_pos);
+	fatcrypt_debug("DEBUG update_fatcrypt_header_lsize: returning %d\n", res);
+	return res;
+}
 /*---------------------------------------------------------------------------
 
    Public Functions (FatFs API)
@@ -4341,7 +4383,7 @@ FRESULT f_crypt_write (
 	if (res == FR_NO_HEADER) {
 		fatcrypt_debug("DEBUG f_crypt_write: calling init_fatcrypt_header\n");
 		init_fatcrypt_header(fp, &fheader);
-		res = update_fatcrypt_header(fp, &fheader);
+		res = write_fatcrypt_header(fp, &fheader);
 		if (res != FR_OK) return res;
 	} else if (res != FR_OK) {
 		fatcrypt_debug("DEBUG f_crypt_write: parse failed, returning %d\n", res);
@@ -4459,13 +4501,13 @@ FRESULT f_crypt_write (
 		offset_in_sector = 0;
 	}
 
-	// Only update header if we extended the file
+	// Only update header if we changed the file
 	fatcrypt_debug("DEBUG f_crypt_write: DONE crypt_logical_fptr=%llu header.lsize=%llu *bw=%u\n",
 	        (unsigned long long)fp->crypt_logical_fptr, (unsigned long long)fheader.logical_size, *bw);
 	if (fp->crypt_logical_fptr != fheader.logical_size) {
 		fatcrypt_debug("DEBUG f_crypt_write: file extended, updating header\n");
 		fheader.logical_size = fp->crypt_logical_fptr;
-		return update_fatcrypt_header(fp, &fheader);
+		return update_fatcrypt_header_lsize(fp, &fheader);
 	}
 
 	fatcrypt_debug("DEBUG f_crypt_write: SUCCESS, no header update needed\n");
@@ -5540,6 +5582,18 @@ FRESULT f_crypt_truncate (
 		physical_size = FATCRYPT_HEADER_SIZE;
 	}
 
+	res = parse_fatcrypt_header(fp, &fheader);
+	if (res == FR_NO_HEADER) {
+		// This file is either corrupt, or it was already zero length.
+		// Write a new header and force truncation to header size.
+		init_fatcrypt_header(fp, &fheader);
+		res = write_fatcrypt_header(fp, &fheader);
+		if (res != FR_OK) return res;
+		physical_size = FATCRYPT_HEADER_SIZE;
+	} else if (res != FR_OK) {
+		return res;
+	}
+
 	// Seek to the physical position
 	res = f_lseek(fp, physical_size);
 	if (res != FR_OK) return res;
@@ -5548,17 +5602,10 @@ FRESULT f_crypt_truncate (
 	res = f_truncate(fp);
 	if (res != FR_OK) return res;
 
-	res = parse_fatcrypt_header(fp, &fheader);
-	if (res == FR_NO_HEADER) {
-		init_fatcrypt_header(fp, &fheader);
-	} else if (res != FR_OK) {
-		return res;
-	}
-
 	fheader.logical_size = logical_size;
 
 	// Update size header
-	return update_fatcrypt_header(fp, &fheader);
+	return update_fatcrypt_header_lsize(fp, &fheader);
 }
 
 
