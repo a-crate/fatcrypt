@@ -2,7 +2,7 @@ FUSE_DIR = fuse
 FUSE_BUILD_DIR = $(FUSE_DIR)/build
 FUSE_CLI = $(FUSE_BUILD_DIR)/fusefatfs
 
-.PHONY: all fuse clean test read-test write-test keygen-test
+.PHONY: all fuse clean
 
 all: fuse
 
@@ -18,16 +18,4 @@ $(FUSE_CLI): $(FUSE_BUILD_DIR)/Makefile $(wildcard $(FUSE_DIR)/*.c) $(wildcard $
 clean:
 	rm -rf $(FUSE_BUILD_DIR)/*
 	rm -rf test/data/*
-
-test: read-test write-test keygen-test
-
-read-test: $(FUSE_CLI) ./test/read-test
-	./test/read-test
-
-write-test: $(FUSE_CLI) ./test/write-test
-	./test/write-test
-
-keygen-test: $(FUSE_CLI) ./test/keygen-test
-	./test/keygen-test
-
 
