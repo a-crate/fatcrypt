@@ -1,1 +1,5 @@
 * Derive per-file keys
+
+* ChaCha20 -> XChaCha20 everywhere
+
+* mount ro, read keys+config, remount.
