@@ -3732,12 +3732,18 @@ FRESULT parse_fatcrypt_header(
 	}
 	if (header_read < FATCRYPT_MAGIC_SIZE) {
 		fatcrypt_debug("DEBUG parse_fatcrypt_header: short magic read\n");
-		res = FR_BAD_HEADER;
+		res = FR_NO_HEADER;
 		goto err;
 	}
 	if (memcmp(FATCRYPT_MAGIC, fp->crypt_header.magic, FATCRYPT_MAGIC_SIZE) != 0) {
-		fatcrypt_debug("DEBUG parse_fatcrypt_header: magic mismatch, expected FATCRYPT\n");
-		res = FR_BAD_HEADER;
+		if (fp->obj.objsize <= FATCRYPT_HEADER_SIZE) {
+			// Probably a seek-extended empty file
+			fatcrypt_debug("DEBUG parse_fatcrypt_header: magic mismatch in logical size 0 file\n");
+			res = FR_NO_HEADER;
+		} else {
+			fatcrypt_debug("DEBUG parse_fatcrypt_header: magic mismatch, corrupted header\n");
+			res = FR_BAD_HEADER;
+		}
 		goto err;
 	}
 
