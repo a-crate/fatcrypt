@@ -12,8 +12,7 @@ The primary use case for this project is embedded devices with the following con
 2. the contents of most files should be encrypted
 3. select files known ahead of time must remain plaintext (bootloader, kernels, etc)
 
-Using this fileysystem is not a good idea. It is a toy. The on-disk format will change again, consider it stable once
-I tag a release.
+Using this fileysystem is not a good idea. It is a toy.
 
 ## Implementation
 
