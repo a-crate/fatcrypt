@@ -20,42 +20,52 @@ I tag a release.
 The implementation in this repository is a FUSE binary for Linux. I plan to port this to Luma3DS.
 Maybe someday I'll port this to grub or systemd-boot for fun.
 
-The FUSE implementation requires selecting the config and master key from outside of the filesystem,
-which obviously allows one to mix up keys and configs, curdle your data, and create really problematic state.
-A good implementation would instead mount the FS read-only, detect the key & config out of `fat_crypt`,
-initialize crypto, and then remount in the final mount mode.
-
 ## Usage
 
 This will walk through setup and usage of an example filesystem on a loopback device.
 
-1. Make and mount a FAT filesystem
+1. Make a FAT filesystem
 ```bash
-mkfs.vfat -F 32 /dev/loop0
-mkdir -p /run/fatcrypt
-mount -o rw /dev/loop0 /run/fatcrypt
+sudo mkfs.vfat -F 32 /dev/loop0
 ```
 
 2. Generate fatcrypt keys and configuration
-```bash
-fatcrypt keygen /run/fatcrypt --interactive \
-    --plaintext-file=config.text --plaintext-dir=grub/ \ # Repeat for whatever files should remain unencrypted
-    --3ds # Use appropriate key sizes and plaintext options for the nintendo 3DS with Luma3DS
 
-cp /run/fatcrypt/.fat_crypt/keys/master.blob ./fatcrypt_key.blob
-cp /run/fatcrypt/.fat_crypt/config.json ./fatcrypt_config.json
-cp /run/fatcrypt/.fat_crypt/config.sig ./fatcrypt_config.sig # TODO: add CLI tool to verify config signatures and generate an up to date signature. This isn't very useful right now
+The keygen subcommand accepts either a directory (mounted filesystem) or a device file directly.
+When given a device, it temporarily mounts it, generates keys, and unmounts.
+
+```bash
+sudo fatcrypt keygen /dev/loop0 --interactive \
+    --plaintext-file=config.text --plaintext-dir=grub/
 ```
 
-3. Re-mount fatcrypt with encryption keys
+OR
 ```bash
-umount /dev/loop0
-fatcrypt -o rw+ /dev/loop0 /run/fatcrypt --master-key ./fatcrypt_key.blob --config ./fatcrypt_config.json
+sudo mkdir -p /run/fatcrypt
+sudo mount -o rw /dev/loop0 /run/fatcrypt
+sudo fatcrypt keygen /run/fatcrypt --interactive \
+    --plaintext-file=config.text --plaintext-dir=grub/
+sudo umount /dev/loop0
+```
+
+After keygen, back up the generated keys:
+```bash
+sudo mkdir -p /run/fatcrypt
+sudo mount -o rw /dev/loop0 /run/fatcrypt
+sudo cp /run/fatcrypt/.fat_crypt/keys/master.blob ./fatcrypt_key.blob
+sudo cp /run/fatcrypt/.fat_crypt/config.json ./fatcrypt_config.json
+sudo umount /dev/loop0
+```
+
+3. Mount fatcrypt with encryption
+```bash
+sudo mkdir -p /run/fatcrypt
+sudo fatcrypt -o rw+ /dev/loop0 /run/fatcrypt
 ```
 
 4. Use the filesystem
 ```bash
-echo "hello world!" > /run/fatcrypt/hello.text
+echo "hello world!" > /run/fatcrypt/hello.txt
 
 cat /run/fatcrypt/hello.txt
 ```

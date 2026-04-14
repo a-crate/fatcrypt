@@ -33,6 +33,12 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <termios.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <unistd.h>
 
 #include <ff.h>
 #include <fftable.h>
@@ -681,7 +687,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 			"usage: " PROGNAME " image mountpoint [options]\n"
-			"   or: " PROGNAME " keygen <directory> [options]\n"
+			"   or: " PROGNAME " keygen <directory|device> [options]\n"
 			"\n"
 			"general options:\n"
 			"    -o opt,[opt...]    mount options\n"
@@ -772,6 +778,58 @@ fff_opt_proc(void *data, const char *arg, int key, struct fuse_args *outargs)
 	}
 }
 
+// Mount a device using this binary as a FUSE filesystem.
+// The FUSE process daemonizes once mounted, so waitpid returning means mount is ready.
+// Returns 0 on success, -1 on failure.
+static int mount_device_for_keygen(const char *device, const char *mountpoint, const char *self_path) {
+	pid_t pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "fork failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	if (pid == 0) {
+		execlp(self_path, self_path, "-o", "rw+", device, mountpoint, NULL);
+		fprintf(stderr, "exec failed: %s\n", strerror(errno));
+		_exit(1);
+	}
+
+	int status;
+	waitpid(pid, &status, 0);
+
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		fprintf(stderr, "Mount failed\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int unmount_device(const char *mountpoint) {
+	pid_t pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "fork failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	if (pid == 0) {
+		execlp("fusermount", "fusermount", "-u", mountpoint, NULL);
+		execlp("fusermount3", "fusermount3", "-u", mountpoint, NULL);
+		fprintf(stderr, "exec fusermount failed: %s\n", strerror(errno));
+		_exit(1);
+	}
+
+	int status;
+	waitpid(pid, &status, 0);
+
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		fprintf(stderr, "Unmount failed\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	// Check for keygen subcommand
@@ -824,16 +882,62 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		// Validate directory was provided
+		// Validate directory/device was provided
 		if (config.mountpoint_dir == NULL) {
-			fprintf(stderr, "Error: keygen requires a directory argument\n\n");
+			fprintf(stderr, "Error: keygen requires a directory or device argument\n\n");
 			usage();
 			free(config.plaintext_files);
 			free(config.plaintext_dirs);
 			return -1;
 		}
 
-		int ret = fatcrypt_keygen(&config);
+		// Check if argument is a block device
+		struct stat sbuf;
+		if (stat(config.mountpoint_dir, &sbuf) < 0) {
+			fprintf(stderr, "%s: %s\n", config.mountpoint_dir, strerror(errno));
+			free(config.plaintext_files);
+			free(config.plaintext_dirs);
+			return -1;
+		}
+
+		int ret;
+		if (S_ISBLK(sbuf.st_mode)) {
+			// Block device: create tmpdir, mount, keygen, unmount
+			char tmpdir[] = "/tmp/fatcrypt.XXXXXX";
+			if (mkdtemp(tmpdir) == NULL) {
+				fprintf(stderr, "Failed to create temp directory: %s\n", strerror(errno));
+				free(config.plaintext_files);
+				free(config.plaintext_dirs);
+				return -1;
+			}
+
+			const char *device_path = config.mountpoint_dir;
+			printf("Mounting %s at %s...\n", device_path, tmpdir);
+
+			if (mount_device_for_keygen(device_path, tmpdir, argv[0]) != 0) {
+				rmdir(tmpdir);
+				free(config.plaintext_files);
+				free(config.plaintext_dirs);
+				return -1;
+			}
+
+			config.mountpoint_dir = tmpdir;
+			ret = fatcrypt_keygen(&config);
+
+			printf("Unmounting %s...\n", tmpdir);
+			if (unmount_device(tmpdir) != 0) {
+				fprintf(stderr, "Warning: unmount failed\n");
+			}
+			rmdir(tmpdir);
+		} else if (S_ISDIR(sbuf.st_mode)) {
+			ret = fatcrypt_keygen(&config);
+		} else {
+			fprintf(stderr, "Error: %s is not a directory or block device\n", config.mountpoint_dir);
+			free(config.plaintext_files);
+			free(config.plaintext_dirs);
+			return -1;
+		}
+
 		free(config.plaintext_files);
 		free(config.plaintext_dirs);
 		return ret;
