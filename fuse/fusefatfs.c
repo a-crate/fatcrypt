@@ -717,6 +717,7 @@ struct options {
 	const char *source;
 	const char *mountpoint;
 	int encrypt;
+	int debug;
 	int ro;
 	int rw;
 	int rwplus;
@@ -736,6 +737,7 @@ static struct fuse_opt fff_opts[] =
 	FFF_OPT("-e", encrypt, 1),
 	FFF_OPT("--encrypt", encrypt, 1),
 	FFF_OPT("encrypt", encrypt, 1),
+	FFF_OPT("--crypt-debug", debug, 1),
 
 	FUSE_OPT_KEY("-V", 'V'),
 	FUSE_OPT_KEY("--version", 'V'),
@@ -964,6 +966,8 @@ int main(int argc, char *argv[])
 				"or: -o rw,force\n\n");
 		options.ro = 1;
 	}
+
+	fatcrypt_debug_log(options.debug);
 
 	if (options.source == NULL || options.mountpoint == NULL) {
 		usage();

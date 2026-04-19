@@ -438,11 +438,8 @@ void ff_mutex_give (int vol);		/* Unlock sync object */
 #define AM_DIR	0x10	/* Directory */
 #define AM_ARC	0x20	/* Archive */
 
-
 /* Encryption nonsense */
-
-// Minimum header: 8 (magic) + 1 (version) + 16 (UUID) + 12 (nonce) + 2 (aad_len) = 39 bytes
-#define FATCRYPT_MIN_HEADER_SIZE 39
+void fatcrypt_debug_log(const int);
 
 #ifdef __cplusplus
 }

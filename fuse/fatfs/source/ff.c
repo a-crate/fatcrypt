@@ -3650,16 +3650,14 @@ static FRESULT validate (	/* Returns FR_OK or FR_INVALID_OBJECT */
 /*------------------------*/
 /* Debug logging helper   */
 /*------------------------*/
+int fatcrypt_debug_logs = 0;
+
+void fatcrypt_debug_log(const int i) {
+	fatcrypt_debug_logs = i;
+}
+
 static void fatcrypt_debug(const char *format, ...) {
-	static int debug_enabled = -1;
-
-	// Check environment variable once
-	if (debug_enabled == -1) {
-		const char *env = getenv("FATCRYPT_DEBUG");
-		debug_enabled = (env != NULL && strcmp(env, "1") == 0);
-	}
-
-	if (debug_enabled) {
+	if (fatcrypt_debug_logs) {
 		va_list args;
 		va_start(args, format);
 		vfprintf(stderr, format, args);
